@@ -317,6 +317,32 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(indexCommand, queryCommand, clearCommand, statsCommand);
 }
 
+// Command: Set / Store Google API key in VS Code SecretStorage
+const setApiKeyCommand = vscode.commands.registerCommand('semanticSearch.setApiKey', async (context: vscode.ExtensionContext) => {
+    try {
+      const key = await vscode.window.showInputBox({
+        prompt: 'Paste Google API key (Gemini / Gen AI API)',
+        ignoreFocusOut: true,
+        placeHolder: 'GOOGLE_API_KEY'
+      });
+      if (!key) {
+        vscode.window.showInformationMessage('No API key provided.');
+        return;
+      }
+
+      if (context?.secrets) {
+        await context.secrets.store('GOOGLE_API_KEY', key);
+        vscode.window.showInformationMessage('Stored GOOGLE_API_KEY in VS Code SecretStorage.');
+      } else {
+        // SecretStorage unavailable (very unusual), warn user and suggest env var fallback
+        vscode.window.showWarningMessage('Could not access SecretStorage. Set GOOGLE_API_KEY as an env variable for development.');
+      }
+    } catch (err) {
+      vscode.window.showErrorMessage('Failed to store API key: ' + (err && (err as Error).message ? (err as Error).message : String(err)));
+    }
+  });
+
+
 export function deactivate() {
   console.log('semantic-code-search: deactivated');
 }

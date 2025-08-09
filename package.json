@@ -11,7 +11,8 @@
     "onCommand:semanticSearch.indexWorkspace",
     "onCommand:semanticSearch.query",
     "onCommand:semanticSearch.clearIndex",
-    "onCommand:semanticSearch.showStats"
+    "onCommand:semanticSearch.showStats",
+    "onCommand:semanticSearch.setApiKey"
   ],
   "contributes": {
     "commands": [
