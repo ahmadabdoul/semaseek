@@ -1,0 +1,49 @@
+{
+  "name": "semaseek",
+  "displayName": "SemaSeek - Semantic Code Search (Starter)",
+  "description": "Natural-language semantic search for your codebase (starter).",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onCommand:semanticSearch.indexWorkspace",
+    "onCommand:semanticSearch.query",
+    "onCommand:semanticSearch.clearIndex",
+    "onCommand:semanticSearch.showStats"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "semanticSearch.indexWorkspace",
+        "title": "Semantic Search: Index Workspace"
+      },
+      {
+        "command": "semanticSearch.query",
+        "title": "Semantic Search: Query"
+      },
+      {
+        "command": "semanticSearch.clearIndex",
+        "title": "Semantic Search: Clear Index"
+      },
+      {
+        "command": "semanticSearch.showStats",
+        "title": "Semantic Search: Show Index Stats"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "prepublish": "npm run compile",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.1",
+    "@types/vscode": "^1.102.0",
+    "@vscode/vsce": "^3.6.0",
+    "typescript": "^5.9.2",
+    "vscode-test": "^1.6.1"
+  }
+}
