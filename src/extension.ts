@@ -206,53 +206,81 @@ export async function getEmbedding(text: string | string[], context?: vscode.Ext
 // ---------------------------
 // Indexing logic
 // ---------------------------
-
-async function indexWorkspace(progress: vscode.Progress<{ message?: string; increment?: number }>, token: vscode.CancellationToken) {
-  vectorStore.clear();
-
-  // Adjust glob as desired
-  const fileGlob = '**/*.{js,ts,jsx,tsx,py,java,go,rs,md}';
-  const uris = await vscode.workspace.findFiles(fileGlob, '**/node_modules/**');
-
-  const total = uris.length;
-  let processed = 0;
-
-  for (const uri of uris) {
-    if (token.isCancellationRequested) break;
-    try {
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const text = Buffer.from(bytes).toString('utf8');
-      const chunks = chunkText(text);
-      for (const c of chunks) {
-        const id = `${uri.toString()}::${c.start}-${c.end}`;
-        const chunk: DocChunk = { id, uri: uri.toString(), start: c.start, end: c.end, text: c.text, embedding: null };
-        vectorStore.add(chunk);
+async function indexWorkspace(progress: vscode.Progress<{ message?: string; increment?: number }>, token: vscode.CancellationToken, context?: vscode.ExtensionContext) {
+    vectorStore.clear();
+  
+    // Adjust glob as desired
+    const fileGlob = '**/*.{js,ts,jsx,tsx,py,java,go,rs,md}';
+    const uris = await vscode.workspace.findFiles(fileGlob, '**/node_modules/**');
+  
+    const total = uris.length;
+    let processed = 0;
+  
+    for (const uri of uris) {
+      if (token.isCancellationRequested) break;
+      try {
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const text = Buffer.from(bytes).toString('utf8');
+        const chunks = chunkText(text);
+        for (const c of chunks) {
+          const id = `${uri.toString()}::${c.start}-${c.end}`;
+          const chunk: DocChunk = { id, uri: uri.toString(), start: c.start, end: c.end, text: c.text, embedding: null };
+          vectorStore.add(chunk);
+        }
+      } catch (e) {
+        // ignore file read errors
       }
-    } catch (e) {
-      // ignore file read errors
+      processed++;
+      const pct = Math.floor((processed / total) * 100);
+      progress.report({ message: `Indexing ${uri.fsPath} (${processed}/${total})`, increment: pct });
     }
-    processed++;
-    const pct = Math.floor((processed / total) * 100);
-    progress.report({ message: `Indexing ${uri.fsPath} (${processed}/${total})`, increment: pct });
+  
+    // Batch-create embeddings using getEmbedding(texts, context)
+    const items = (vectorStore as any).items as DocChunk[];
+    const BATCH_SIZE = 20; // adjust as needed
+  
+    for (let i = 0; i < items.length; i += BATCH_SIZE) {
+      if (token.isCancellationRequested) break;
+      const batch = items.slice(i, i + BATCH_SIZE);
+      const texts = batch.map(b => b.text);
+  
+      // Simple retry/backoff
+      const maxAttempts = 3;
+      let attempt = 0;
+      let embeddings: number[][] | number[] | null = null;
+      while (attempt < maxAttempts) {
+        try {
+          // getEmbedding may accept an array and return an array of vectors
+          // or accept a single string and return a single vector. We handle both.
+          const resp = await getEmbedding(texts, context);
+          embeddings = resp as any;
+          break;
+        } catch (err) {
+          attempt++;
+          const waitMs = Math.pow(2, attempt) * 1000; // exponential backoff
+          await new Promise((res) => setTimeout(res, waitMs));
+          if (attempt >= maxAttempts) {
+            console.error('Failed to fetch embeddings for batch:', err);
+          }
+        }
+      }
+  
+      if (Array.isArray(embeddings) && Array.isArray(embeddings[0])) {
+        // embeddings is number[][]
+        for (let j = 0; j < batch.length; j++) {
+          batch[j].embedding = (embeddings as number[][])[j] || null;
+        }
+      } else if (Array.isArray(embeddings) && typeof embeddings[0] === 'number' && batch.length === 1) {
+        // single vector returned for a single input
+        batch[0].embedding = embeddings as number[];
+      } else {
+        // fallback: set nulls
+        for (const b of batch) b.embedding = null;
+      }
+  
+      progress.report({ message: `Embedding chunks ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}` });
+    }
   }
-
-  // Batch-create embeddings (naive sequential implementation)
-  const items = (vectorStore as any).items as DocChunk[];
-  for (let i = 0; i < items.length; i++) {
-    if (token.isCancellationRequested) break;
-    try {
-      const emb = await getEmbedding(items[i].text);
-      items[i].embedding = emb;
-    } catch (e) {
-      items[i].embedding = null;
-    }
-    // optional: report progress every N items
-    if (i % 50 === 0) {
-      progress.report({ message: `Embedding chunks ${i}/${items.length}` });
-    }
-  }
-}
-
 // ---------------------------
 // Commands
 // ---------------------------
