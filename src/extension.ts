@@ -16,6 +16,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+let genaiClient: any | null = null;
 
 // ---------------------------
 // Simple in-memory vector store
@@ -29,6 +30,7 @@ type DocChunk = {
   text: string;
   embedding: number[] | null;
 };
+
 
 class InMemoryVectorStore {
   private items: DocChunk[] = [];
@@ -62,6 +64,47 @@ const vectorStore = new InMemoryVectorStore();
 // Utilities
 // ---------------------------
 
+/**
+ * Initialize GenAI client (one-time).
+ * Priority order for API key:
+ *  1) context.secrets (recommended for installed extension)
+ *  2) process.env.GOOGLE_API_KEY (dev or CI)
+ */
+async function initGenAI(context?: vscode.ExtensionContext) {
+  if (genaiClient) return genaiClient;
+
+  // try SecretStorage (recommended)
+  let apiKey: string | undefined;
+  try {
+    if (context?.secrets) {
+      apiKey = await context.secrets.get('GOOGLE_API_KEY') || undefined;
+    }
+  } catch {
+    apiKey = undefined;
+  }
+
+  // fallback to env var (local dev)
+  if (!apiKey && process.env.GOOGLE_API_KEY) {
+    apiKey = process.env.GOOGLE_API_KEY;
+  }
+
+  if (!apiKey) {
+    // Throwing lets callers surface a helpful message to user
+    throw new Error(
+      'Google API key not found. Store one in VS Code SecretStorage under key GOOGLE_API_KEY, or set env GOOGLE_API_KEY.'
+    );
+  }
+
+  // lazy import SDK so installing the extension without the package doesn't break activation
+  const { Models, Client } = await import('@google/genai'); // package exports
+  // Most examples use a single `ai` client with .models.* methods.
+  // create client: SDK will accept apiKey param
+  // NOTE: exact constructor shape can vary by version; this follows official docs.
+  const ai = new (Client ?? (Models && Models))({ apiKey }); // defensive fallback
+  genaiClient = ai;
+  return genaiClient;
+}
+
 function cosineSimilarity(a: number[], b: number[]) {
   let dot = 0;
   let na = 0;
@@ -92,27 +135,74 @@ function chunkText(text: string, maxChars = 1200, overlap = 200) {
 // Embedding provider placeholder
 // ---------------------------
 
-// TODO: replace this function with your embedding provider implementation.
-// Example options:
-// - OpenAI embeddings (client SDK)
-// - Local LLM embedding server
-// - Lightweight on-device embedding
 
-async function getEmbedding(text: string): Promise<number[]> {
-  // Placeholder: returns a deterministic pseudo-embedding based on char codes.
-  // THIS IS NOT SEMANTIC — replace it.
-  const seed = 31;
-  const hashLen = 128;
-  const vec = new Array(hashLen).fill(0);
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    vec[(i * seed) % hashLen] = (vec[(i * seed) % hashLen] + code) % 1000;
+export async function getEmbedding(text: string | string[], context?: vscode.ExtensionContext): Promise<number[] | number[][]> {
+    const client = await initGenAI(context);
+  
+    // Normalize to array of strings
+    const contents = Array.isArray(text) ? text : [text];
+  
+    // Choose model (gemini-embedding-001 recommended). You can make this configurable.
+    const MODEL = 'gemini-embedding-001';
+  
+    // Call embedContent API (batch)
+    let resp: any;
+    try {
+      resp = await client.models.embedContent({
+        model: MODEL,
+        contents,            // array of inputs
+        // optional config:
+        // config: { outputDimensionality: 1536 } // to reduce to 1536 dims, if you want
+      });
+    } catch (err) {
+      // surface useful error
+      const message = (err && err.message) ? err.message : String(err);
+      throw new Error(`Gemini embedContent failed: ${message}`);
+    }
+  
+    // Defensive: extract embeddings for each input
+    // Common shapes (depending on SDK version):
+    //  - resp.embeddings -> array of arrays
+    //  - resp.data[0].embedding or resp.data[i].embedding (object) -> might contain .values
+    const tryExtract = (r: any): number[][] | null => {
+      if (!r) return null;
+      if (Array.isArray(r.embeddings) && r.embeddings.length > 0 && Array.isArray(r.embeddings[0])) {
+        return r.embeddings as number[][];
+      }
+      if (Array.isArray(r.data) && r.data.length > 0) {
+        // common pattern: data[i].embedding or data[i].embedding.values
+        const out: number[][] = [];
+        for (const d of r.data) {
+          if (!d) continue;
+          if (Array.isArray(d.embedding)) out.push(d.embedding as number[]);
+          else if (Array.isArray(d.embedding?.values)) out.push(d.embedding.values as number[]);
+          else if (Array.isArray(d.embedding?.embedding)) out.push(d.embedding.embedding as number[]);
+          else if (Array.isArray(d.values)) out.push(d.values as number[]);
+          else if (Array.isArray(d.embedding?.vector)) out.push(d.embedding.vector as number[]);
+        }
+        if (out.length > 0) return out;
+      }
+      // some SDKs return an outputs array
+      if (Array.isArray(r.outputs) && r.outputs.length > 0 && Array.isArray(r.outputs[0].embedding)) {
+        return r.outputs.map((o: any) => o.embedding as number[]);
+      }
+      return null;
+    };
+  
+    const extracted = tryExtract(resp);
+    if (!extracted) {
+      // last attempt: if response itself is a flat numerical array (single input)
+      if (Array.isArray(resp) && typeof resp[0] === 'number') {
+        return [resp as number[]];
+      }
+      // couldn't parse
+      throw new Error('Unexpected Gemini embeddings response shape — check SDK docs or log full response.');
+    }
+  
+    // If caller asked for single input, return single vector
+    if (!Array.isArray(text)) return extracted[0];
+    return extracted;
   }
-  // normalize
-  const mag = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
-  return vec.map(v => v / (mag || 1));
-}
-
 // ---------------------------
 // Indexing logic
 // ---------------------------
