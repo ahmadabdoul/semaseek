@@ -45,5 +45,8 @@
     "@vscode/vsce": "^3.6.0",
     "typescript": "^5.9.2",
     "vscode-test": "^1.6.1"
+  },
+  "dependencies": {
+    "@google/genai": "^1.13.0"
   }
 }
