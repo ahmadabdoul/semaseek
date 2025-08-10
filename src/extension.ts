@@ -1,22 +1,18 @@
-/*
+/**
   semantic-code-search - starter VS Code extension (single-file starter)
 
-  What's included (high-level):
-  - workspace indexing command (walks files, chunks, creates embeddings via pluggable provider)
-  - in-memory vector store with cosine-similarity search (placeholder - replace with sqlite/FAISS/etc.)
+  - workspace indexing command (walks files, chunks, creates embeddings via Gemini)
+  - in-memory vector store with cosine-similarity search
   - query command (input box -> semantic search -> quickpick results -> open editor at match)
-  - simple stats & clear-index commands
-
-  Notes:
-  - Implement `getEmbedding(text)` to call your chosen embedding provider (OpenAI, local LLM, etc.).
-  - For production, swap the in-memory store with a persisted vector DB (sqlite + vectordb, milvus, qdrant, or cloud-hosted).
-  - Add package.json with activation events and commands. See comments at bottom for a minimal `package.json` snippet.
+  - stats, clear-index, and set-api-key commands
 */
 
 import * as vscode from 'vscode';
 import * as path from 'path';
-import * as fs from 'fs/promises';
-let genaiClient: any | null = null;
+// dynamic import of the GenAI SDK types (we'll import the runtime below)
+import { GoogleGenAI } from '@google/genai';
+
+let genaiClient: GoogleGenAI | null = null;
 
 // ---------------------------
 // Simple in-memory vector store
@@ -31,9 +27,9 @@ type DocChunk = {
   embedding: number[] | null;
 };
 
-
 class InMemoryVectorStore {
-  private items: DocChunk[] = [];
+  // expose items for indexing code (small helper)
+  public items: DocChunk[] = [];
 
   add(chunk: DocChunk) {
     this.items.push(chunk);
@@ -64,45 +60,13 @@ const vectorStore = new InMemoryVectorStore();
 // Utilities
 // ---------------------------
 
-/**
- * Initialize GenAI client (one-time).
- * Priority order for API key:
- *  1) context.secrets (recommended for installed extension)
- *  2) process.env.GOOGLE_API_KEY (dev or CI)
- */
-async function initGenAI(context?: vscode.ExtensionContext) {
-  if (genaiClient) return genaiClient;
-
-  // try SecretStorage (recommended)
-  let apiKey: string | undefined;
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
   try {
-    if (context?.secrets) {
-      apiKey = await context.secrets.get('GOOGLE_API_KEY') || undefined;
-    }
+    return String(err);
   } catch {
-    apiKey = undefined;
+    return 'Unknown error';
   }
-
-  // fallback to env var (local dev)
-  if (!apiKey && process.env.GOOGLE_API_KEY) {
-    apiKey = process.env.GOOGLE_API_KEY;
-  }
-
-  if (!apiKey) {
-    // Throwing lets callers surface a helpful message to user
-    throw new Error(
-      'Google API key not found. Store one in VS Code SecretStorage under key GOOGLE_API_KEY, or set env GOOGLE_API_KEY.'
-    );
-  }
-
-  // lazy import SDK so installing the extension without the package doesn't break activation
-  const { Models, Client } = await import('@google/genai'); // package exports
-  // Most examples use a single `ai` client with .models.* methods.
-  // create client: SDK will accept apiKey param
-  // NOTE: exact constructor shape can vary by version; this follows official docs.
-  const ai = new (Client ?? (Models && Models))({ apiKey }); // defensive fallback
-  genaiClient = ai;
-  return genaiClient;
 }
 
 function cosineSimilarity(a: number[], b: number[]) {
@@ -131,46 +95,87 @@ function chunkText(text: string, maxChars = 1200, overlap = 200) {
   return chunks;
 }
 
+/**
+ * Normalize embedding result:
+ * getEmbedding may return number[] (single) or number[][] (batch).
+ * This returns a single vector (first) for callers that expect one vector.
+ */
+function normalizeEmbeddingResult(res: number[] | number[][]): number[] {
+  if (Array.isArray(res) && res.length > 0 && Array.isArray(res[0])) {
+    return (res as number[][])[0];
+  }
+  return res as number[];
+}
+
 // ---------------------------
-// Embedding provider placeholder
+// Gemini / GenAI embedding adapter
 // ---------------------------
 
+/**
+ * Initialize GenAI client (one-time).
+ * Priority order for API key:
+ *  1) context.secrets (recommended for installed extension)
+ *  2) process.env.GOOGLE_API_KEY or process.env.GEMINI_API_KEY (dev or CI)
+ */
+async function initGenAI(context?: vscode.ExtensionContext) {
+  if (genaiClient) return genaiClient;
 
-export async function getEmbedding(text: string | string[], context?: vscode.ExtensionContext): Promise<number[] | number[][]> {
-    const client = await initGenAI(context);
-  
-    // Normalize to array of strings
-    const contents = Array.isArray(text) ? text : [text];
-  
-    // Choose model (gemini-embedding-001 recommended). You can make this configurable.
-    const MODEL = 'gemini-embedding-001';
-  
-    // Call embedContent API (batch)
-    let resp: any;
-    try {
-      resp = await client.models.embedContent({
-        model: MODEL,
-        contents,            // array of inputs
-        // optional config:
-        // config: { outputDimensionality: 1536 } // to reduce to 1536 dims, if you want
-      });
-    } catch (err) {
-      // surface useful error
-      const message = (err && err.message) ? err.message : String(err);
-      throw new Error(`Gemini embedContent failed: ${message}`);
+  // try SecretStorage (recommended)
+  let apiKey: string | undefined;
+  try {
+    if (context?.secrets) {
+      apiKey = (await context.secrets.get('GOOGLE_API_KEY')) || undefined;
     }
-  
-    // Defensive: extract embeddings for each input
-    // Common shapes (depending on SDK version):
-    //  - resp.embeddings -> array of arrays
-    //  - resp.data[0].embedding or resp.data[i].embedding (object) -> might contain .values
+  } catch {
+    apiKey = undefined;
+  }
+
+  // fallback to env var (local dev)
+  if (!apiKey && (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY)) {
+    apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
+  }
+
+  if (!apiKey) {
+    throw new Error(
+      'Google API key not found. Store one in VS Code SecretStorage under key GOOGLE_API_KEY, or set env GOOGLE_API_KEY/GEMINI_API_KEY.'
+    );
+  }
+
+  // Construct the GoogleGenAI client
+  // (typed import at top; actual runtime is available after npm i @google/genai)
+  const ai = new GoogleGenAI({ apiKey });
+  genaiClient = ai;
+  return genaiClient;
+}
+
+/**
+ * Generate embeddings for a single string or a batch of strings.
+ * Returns number[] for single input, or number[][] for multiple inputs.
+ */
+export async function getEmbedding(text: string | string[], context?: vscode.ExtensionContext): Promise<number[] | number[][]> {
+  const client = await initGenAI(context);
+
+  const contents = Array.isArray(text) ? text : [text];
+  const MODEL = 'gemini-embedding-001';
+
+  try {
+    // NOTE: shape and method names depend on SDK version. `client.models.embedContent` is used in examples.
+    // Use `as any` to avoid tight TypeScript coupling to SDK shapes.
+    const resp: any = await (client as any).models.embedContent({
+      model: MODEL,
+      contents,
+      // optional: config: { outputDimensionality: 1536 }
+    });
+
+    // Defensive extraction of embeddings from common SDK shapes
     const tryExtract = (r: any): number[][] | null => {
       if (!r) return null;
+      // common: r.embeddings -> [[...], [...]]
       if (Array.isArray(r.embeddings) && r.embeddings.length > 0 && Array.isArray(r.embeddings[0])) {
         return r.embeddings as number[][];
       }
+      // common: r.data -> [{ embedding: [...] }, ...] or embedding.values
       if (Array.isArray(r.data) && r.data.length > 0) {
-        // common pattern: data[i].embedding or data[i].embedding.values
         const out: number[][] = [];
         for (const d of r.data) {
           if (!d) continue;
@@ -182,107 +187,104 @@ export async function getEmbedding(text: string | string[], context?: vscode.Ext
         }
         if (out.length > 0) return out;
       }
-      // some SDKs return an outputs array
+      // some SDKs use outputs
       if (Array.isArray(r.outputs) && r.outputs.length > 0 && Array.isArray(r.outputs[0].embedding)) {
         return r.outputs.map((o: any) => o.embedding as number[]);
       }
       return null;
     };
-  
+
     const extracted = tryExtract(resp);
     if (!extracted) {
       // last attempt: if response itself is a flat numerical array (single input)
       if (Array.isArray(resp) && typeof resp[0] === 'number') {
         return [resp as number[]];
       }
-      // couldn't parse
       throw new Error('Unexpected Gemini embeddings response shape — check SDK docs or log full response.');
     }
-  
-    // If caller asked for single input, return single vector
+
     if (!Array.isArray(text)) return extracted[0];
     return extracted;
+  } catch (err) {
+    throw new Error(`Gemini embedContent failed: ${getErrorMessage(err)}`);
   }
+}
+
 // ---------------------------
 // Indexing logic
 // ---------------------------
+
 async function indexWorkspace(progress: vscode.Progress<{ message?: string; increment?: number }>, token: vscode.CancellationToken, context?: vscode.ExtensionContext) {
-    vectorStore.clear();
-  
-    // Adjust glob as desired
-    const fileGlob = '**/*.{js,ts,jsx,tsx,py,java,go,rs,md}';
-    const uris = await vscode.workspace.findFiles(fileGlob, '**/node_modules/**');
-  
-    const total = uris.length;
-    let processed = 0;
-  
-    for (const uri of uris) {
-      if (token.isCancellationRequested) break;
-      try {
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        const text = Buffer.from(bytes).toString('utf8');
-        const chunks = chunkText(text);
-        for (const c of chunks) {
-          const id = `${uri.toString()}::${c.start}-${c.end}`;
-          const chunk: DocChunk = { id, uri: uri.toString(), start: c.start, end: c.end, text: c.text, embedding: null };
-          vectorStore.add(chunk);
-        }
-      } catch (e) {
-        // ignore file read errors
+  vectorStore.clear();
+
+  // Adjust glob as desired
+  const fileGlob = '**/*.{js,ts,jsx,tsx,py,java,go,rs,md}';
+  const uris = await vscode.workspace.findFiles(fileGlob, '**/node_modules/**');
+
+  const total = uris.length;
+  let processed = 0;
+
+  for (const uri of uris) {
+    if (token.isCancellationRequested) break;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const text = Buffer.from(bytes).toString('utf8');
+      const chunks = chunkText(text);
+      for (const c of chunks) {
+        const id = `${uri.toString()}::${c.start}-${c.end}`;
+        const chunk: DocChunk = { id, uri: uri.toString(), start: c.start, end: c.end, text: c.text, embedding: null };
+        vectorStore.add(chunk);
       }
-      processed++;
-      const pct = Math.floor((processed / total) * 100);
-      progress.report({ message: `Indexing ${uri.fsPath} (${processed}/${total})`, increment: pct });
+    } catch (e) {
+      // ignore file read errors
     }
-  
-    // Batch-create embeddings using getEmbedding(texts, context)
-    const items = (vectorStore as any).items as DocChunk[];
-    const BATCH_SIZE = 20; // adjust as needed
-  
-    for (let i = 0; i < items.length; i += BATCH_SIZE) {
-      if (token.isCancellationRequested) break;
-      const batch = items.slice(i, i + BATCH_SIZE);
-      const texts = batch.map(b => b.text);
-  
-      // Simple retry/backoff
-      const maxAttempts = 3;
-      let attempt = 0;
-      let embeddings: number[][] | number[] | null = null;
-      while (attempt < maxAttempts) {
-        try {
-          // getEmbedding may accept an array and return an array of vectors
-          // or accept a single string and return a single vector. We handle both.
-          const resp = await getEmbedding(texts, context);
-          embeddings = resp as any;
-          break;
-        } catch (err) {
-          attempt++;
-          const waitMs = Math.pow(2, attempt) * 1000; // exponential backoff
-          await new Promise((res) => setTimeout(res, waitMs));
-          if (attempt >= maxAttempts) {
-            console.error('Failed to fetch embeddings for batch:', err);
-          }
-        }
-      }
-  
-      if (Array.isArray(embeddings) && Array.isArray(embeddings[0])) {
-        // embeddings is number[][]
-        for (let j = 0; j < batch.length; j++) {
-          batch[j].embedding = (embeddings as number[][])[j] || null;
-        }
-      } else if (Array.isArray(embeddings) && typeof embeddings[0] === 'number' && batch.length === 1) {
-        // single vector returned for a single input
-        batch[0].embedding = embeddings as number[];
-      } else {
-        // fallback: set nulls
-        for (const b of batch) b.embedding = null;
-      }
-  
-      progress.report({ message: `Embedding chunks ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}` });
-    }
+    processed++;
+    const pct = total > 0 ? Math.floor((processed / total) * 100) : 100;
+    progress.report({ message: `Indexing ${uri.fsPath} (${processed}/${total})`, increment: pct });
   }
+
+  // Batch-create embeddings using getEmbedding(texts, context)
+  const items = vectorStore.items;
+  const BATCH_SIZE = 20; // tune to your rate limits and memory
+  for (let i = 0; i < items.length; i += BATCH_SIZE) {
+    if (token.isCancellationRequested) break;
+    const batch = items.slice(i, i + BATCH_SIZE);
+    const texts = batch.map(b => b.text);
+
+    const maxAttempts = 3;
+    let attempt = 0;
+    let embeddings: number[][] | number[] | null = null;
+    while (attempt < maxAttempts) {
+      try {
+        const resp = await getEmbedding(texts, context);
+        embeddings = resp as any;
+        break;
+      } catch (err) {
+        attempt++;
+        const waitMs = Math.pow(2, attempt) * 1000;
+        await new Promise((res) => setTimeout(res, waitMs));
+        if (attempt >= maxAttempts) {
+          console.error('Failed to fetch embeddings for batch:', getErrorMessage(err));
+        }
+      }
+    }
+
+    if (Array.isArray(embeddings) && Array.isArray(embeddings[0])) {
+      for (let j = 0; j < batch.length; j++) {
+        batch[j].embedding = (embeddings as number[][])[j] || null;
+      }
+    } else if (Array.isArray(embeddings) && typeof (embeddings as any)[0] === 'number' && batch.length === 1) {
+      batch[0].embedding = embeddings as number[];
+    } else {
+      for (const b of batch) b.embedding = null;
+    }
+
+    progress.report({ message: `Embedding chunks ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}` });
+  }
+}
+
 // ---------------------------
-// Commands
+// Commands & activation
 // ---------------------------
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -290,7 +292,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   const indexCommand = vscode.commands.registerCommand('semanticSearch.indexWorkspace', async () => {
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Indexing workspace for semantic search', cancellable: true }, async (p, token) => {
-      await indexWorkspace(p, token);
+      await indexWorkspace(p, token, context);
       vscode.window.showInformationMessage(`Indexed ${vectorStore.size()} text chunks for semantic search.`);
     });
   });
@@ -306,7 +308,16 @@ export async function activate(context: vscode.ExtensionContext) {
     const q = await vscode.window.showInputBox({ prompt: 'Search code semantically (natural language)' });
     if (!q) return;
 
-    const qEmb = await getEmbedding(q);
+    // get embedding (may return single vector or batch)
+    let qEmbRaw: number[] | number[][];
+    try {
+      qEmbRaw = await getEmbedding(q, context);
+    } catch (err) {
+      vscode.window.showErrorMessage('Failed to get query embedding: ' + getErrorMessage(err));
+      return;
+    }
+
+    const qEmb = normalizeEmbeddingResult(qEmbRaw);
     const results = await vectorStore.searchByEmbedding(qEmb, 12);
 
     if (results.length === 0) {
@@ -342,11 +353,8 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.showInformationMessage(`Indexed chunks: ${vectorStore.size()}`);
   });
 
-  context.subscriptions.push(indexCommand, queryCommand, clearCommand, statsCommand);
-}
-
-// Command: Set / Store Google API key in VS Code SecretStorage
-const setApiKeyCommand = vscode.commands.registerCommand('semanticSearch.setApiKey', async (context: vscode.ExtensionContext) => {
+  // Set / Store Google API key in VS Code SecretStorage
+  const setApiKeyCommand = vscode.commands.registerCommand('semanticSearch.setApiKey', async () => {
     try {
       const key = await vscode.window.showInputBox({
         prompt: 'Paste Google API key (Gemini / Gen AI API)',
@@ -362,14 +370,15 @@ const setApiKeyCommand = vscode.commands.registerCommand('semanticSearch.setApiK
         await context.secrets.store('GOOGLE_API_KEY', key);
         vscode.window.showInformationMessage('Stored GOOGLE_API_KEY in VS Code SecretStorage.');
       } else {
-        // SecretStorage unavailable (very unusual), warn user and suggest env var fallback
         vscode.window.showWarningMessage('Could not access SecretStorage. Set GOOGLE_API_KEY as an env variable for development.');
       }
     } catch (err) {
-      vscode.window.showErrorMessage('Failed to store API key: ' + (err && (err as Error).message ? (err as Error).message : String(err)));
+      vscode.window.showErrorMessage('Failed to store API key: ' + getErrorMessage(err));
     }
   });
 
+  context.subscriptions.push(indexCommand, queryCommand, clearCommand, statsCommand, setApiKeyCommand);
+}
 
 export function deactivate() {
   console.log('semantic-code-search: deactivated');
@@ -381,38 +390,23 @@ function truncate(s: string, n: number) {
 }
 
 /*
-  Minimal package.json snippet (add this to your extension's package.json):
-
-  {
-    "name": "semantic-code-search",
-    "displayName": "Semantic Code Search (Starter)",
-    "description": "Starter VS Code extension for semantic search in a workspace (pluggable embeddings).",
-    "version": "0.0.1",
-    "engines": { "vscode": "^1.70.0" },
+  NOTES:
+  - Ensure your package.json contributes the commands and activationEvents:
     "activationEvents": [
       "onCommand:semanticSearch.indexWorkspace",
-      "onCommand:semanticSearch.query"
+      "onCommand:semanticSearch.query",
+      "onCommand:semanticSearch.clearIndex",
+      "onCommand:semanticSearch.showStats",
+      "onCommand:semanticSearch.setApiKey"
     ],
-    "main": "./out/extension.js",
-    "contributes": {
-      "commands": [
-        { "command": "semanticSearch.indexWorkspace", "title": "Semantic Search: Index Workspace" },
-        { "command": "semanticSearch.query", "title": "Semantic Search: Query" },
-        { "command": "semanticSearch.clearIndex", "title": "Semantic Search: Clear Index" },
-        { "command": "semanticSearch.showStats", "title": "Semantic Search: Show Index Stats" }
-      ]
-    },
-    "scripts": {
-      "vscode:prepublish": "npm run compile",
-      "compile": "tsc -p ./",
-      "watch": "tsc -watch -p ./"
-    },
-    "devDependencies": {
-      "typescript": "^4.0.0",
-      "@types/vscode": "^1.70.0",
-      "vscode-test": "^1.6.0"
-    }
-  }
+    and include corresponding contributes.commands entries.
 
-  Remember to create a tsconfig.json for the extension build and wire up the build to produce ./out/extension.js.
+  - Install SDK:
+      npm install @google/genai
+
+  - For local dev you can also set:
+      export GOOGLE_API_KEY="..."   (or on Windows: setx GOOGLE_API_KEY "...")
+    or run the Set API Key command inside the Extension Development Host.
+
+  - Tweak BATCH_SIZE and embedding config according to rate limits and costs.
 */
