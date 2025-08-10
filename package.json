@@ -48,7 +48,12 @@
           "description": "Persist semantic index to SQLite. If false, JSON fallback used."
         }
       }
-    }
+    },
+    "semanticSearch.embeddingModel": {
+  "type": "string",
+  "default": "gemini-embedding-001",
+  "description": "Embedding model to use for Gemini/GenAI."
+}
   },
   "scripts": {
     "compile": "tsc -p .",
