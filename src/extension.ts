@@ -418,18 +418,3 @@ function truncate(s: string, n: number) {
   return s.length <= n ? s : s.slice(0, n - 1) + '…';
 }
 
-/*
-  Notes & troubleshooting:
-
-  - The Gemini docs show using `client.models.embedContent({ model: 'gemini-embedding-001', contents })`
-    and that responses include `response.embeddings`, where each embedding entry exposes `.values`.
-    This file extracts embeddings via resp.embeddings.map(e => e.values).
-
-  - If you see `fetch failed sending request`:
-    * Ensure Node >= 18 (fetch availability) in your dev environment that runs the extension.
-    * Check network/proxy/SSL; the SDK uses fetch under the hood.
-    * Add more logging by inspecting the full error message in the Output channel.
-
-  - Adjust BATCH_SIZE and backoff parameters depending on your observed rate limits.
-  - To switch to the other stable model (`textembedding-gecko@003`), replace MODEL constant in getEmbedding.
-*/
