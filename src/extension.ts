@@ -1,15 +1,13 @@
 /**
-  semantic-code-search - starter VS Code extension (single-file starter)
+  semantic-code-search - patched VS Code extension
 
-  - workspace indexing command (walks files, chunks, creates embeddings via Gemini)
-  - in-memory vector store with cosine-similarity search
-  - query command (input box -> semantic search -> quickpick results -> open editor at match)
-  - stats, clear-index, and set-api-key commands
+  - Uses Gemini embedContent per docs: https://ai.google.dev/gemini-api/docs/embeddings
+  - Robust batching, retries, jitter, and logging
+  - Set API key stored in VS Code SecretStorage
 */
 
 import * as vscode from 'vscode';
 import * as path from 'path';
-// dynamic import of the GenAI SDK types (we'll import the runtime below)
 import { GoogleGenAI } from '@google/genai';
 
 let genaiClient: GoogleGenAI | null = null;
@@ -28,7 +26,6 @@ type DocChunk = {
 };
 
 class InMemoryVectorStore {
-  // expose items for indexing code (small helper)
   public items: DocChunk[] = [];
 
   add(chunk: DocChunk) {
@@ -70,6 +67,7 @@ function getErrorMessage(err: unknown): string {
 }
 
 function cosineSimilarity(a: number[], b: number[]) {
+  if (a.length !== b.length) return 0;
   let dot = 0;
   let na = 0;
   let nb = 0;
@@ -108,15 +106,9 @@ function normalizeEmbeddingResult(res: number[] | number[][]): number[] {
 }
 
 // ---------------------------
-// Gemini / GenAI embedding adapter
+// Gemini / GenAI embedding adapter (per docs)
 // ---------------------------
 
-/**
- * Initialize GenAI client (one-time).
- * Priority order for API key:
- *  1) context.secrets (recommended for installed extension)
- *  2) process.env.GOOGLE_API_KEY or process.env.GEMINI_API_KEY (dev or CI)
- */
 async function initGenAI(context?: vscode.ExtensionContext) {
   if (genaiClient) return genaiClient;
 
@@ -141,78 +133,80 @@ async function initGenAI(context?: vscode.ExtensionContext) {
     );
   }
 
-  // Construct the GoogleGenAI client
-  // (typed import at top; actual runtime is available after npm i @google/genai)
+  // Construct the GoogleGenAI client (SDK expects constructor with options)
   const ai = new GoogleGenAI({ apiKey });
   genaiClient = ai;
   return genaiClient;
 }
 
 /**
- * Generate embeddings for a single string or a batch of strings.
- * Returns number[] for single input, or number[][] for multiple inputs.
+ * getEmbedding: uses client.models.embedContent per Gemini docs.
+ * Accepts either a single string or an array of strings.
+ * Returns number[] for single input, number[][] for batch.
  */
 export async function getEmbedding(text: string | string[], context?: vscode.ExtensionContext): Promise<number[] | number[][]> {
   const client = await initGenAI(context);
-
   const contents = Array.isArray(text) ? text : [text];
+
+  // Use gemini model per docs. Could be switched to textembedding-gecko@003 if wanted.
   const MODEL = 'gemini-embedding-001';
+  const TASK = 'SEMANTIC_SIMILARITY';
 
   try {
-    // NOTE: shape and method names depend on SDK version. `client.models.embedContent` is used in examples.
-    // Use `as any` to avoid tight TypeScript coupling to SDK shapes.
+    // According to docs: response.embeddings is the array, each entry has `.values`
     const resp: any = await (client as any).models.embedContent({
       model: MODEL,
-      contents,
-      // optional: config: { outputDimensionality: 1536 }
+      contents,          // array of strings
+      taskType: TASK
+      // some SDK versions use `taskType` or `config: { taskType: ... }`
     });
 
-    // Defensive extraction of embeddings from common SDK shapes
-    const tryExtract = (r: any): number[][] | null => {
-      if (!r) return null;
-      // common: r.embeddings -> [[...], [...]]
-      if (Array.isArray(r.embeddings) && r.embeddings.length > 0 && Array.isArray(r.embeddings[0])) {
-        return r.embeddings as number[][];
-      }
-      // common: r.data -> [{ embedding: [...] }, ...] or embedding.values
-      if (Array.isArray(r.data) && r.data.length > 0) {
-        const out: number[][] = [];
-        for (const d of r.data) {
-          if (!d) continue;
-          if (Array.isArray(d.embedding)) out.push(d.embedding as number[]);
-          else if (Array.isArray(d.embedding?.values)) out.push(d.embedding.values as number[]);
-          else if (Array.isArray(d.embedding?.embedding)) out.push(d.embedding.embedding as number[]);
-          else if (Array.isArray(d.values)) out.push(d.values as number[]);
-          else if (Array.isArray(d.embedding?.vector)) out.push(d.embedding.vector as number[]);
-        }
-        if (out.length > 0) return out;
-      }
-      // some SDKs use outputs
-      if (Array.isArray(r.outputs) && r.outputs.length > 0 && Array.isArray(r.outputs[0].embedding)) {
-        return r.outputs.map((o: any) => o.embedding as number[]);
-      }
-      return null;
-    };
-
-    const extracted = tryExtract(resp);
-    if (!extracted) {
-      // last attempt: if response itself is a flat numerical array (single input)
-      if (Array.isArray(resp) && typeof resp[0] === 'number') {
-        return [resp as number[]];
-      }
-      throw new Error('Unexpected Gemini embeddings response shape — check SDK docs or log full response.');
+    // resp.embeddings is expected (per docs examples)
+    // defensive extraction:
+    if (Array.isArray(resp?.embeddings) && resp.embeddings.length > 0) {
+      // embeddings entries may be objects that include `.values`
+      const extracted: number[][] = resp.embeddings.map((e: any) => {
+        if (Array.isArray(e?.values)) return e.values as number[];
+        // some shapes may include `value` or `embedding` — try alternatives
+        if (Array.isArray(e?.embedding?.values)) return e.embedding.values as number[];
+        if (Array.isArray(e?.embedding)) return e.embedding as number[];
+        if (Array.isArray(e?.values)) return e.values as number[];
+        // fallback: if e is already an array
+        if (Array.isArray(e)) return e as number[];
+        // if nothing matches, throw to be caught below
+        throw new Error('Unexpected embedding entry shape');
+      });
+      return Array.isArray(text) ? extracted : extracted[0];
     }
 
-    if (!Array.isArray(text)) return extracted[0];
-    return extracted;
+    // Some SDK variants return `embeddings` nested differently (defensive)
+    // try resp.data -> map to .embedding.values
+    if (Array.isArray(resp?.data) && resp.data.length > 0) {
+      const extracted2: number[][] = resp.data.map((d: any) => {
+        if (Array.isArray(d?.embedding?.values)) return d.embedding.values as number[];
+        if (Array.isArray(d?.embedding)) return d.embedding as number[];
+        if (Array.isArray(d?.values)) return d.values as number[];
+        throw new Error('Unexpected data.embedding shape');
+      });
+      return Array.isArray(text) ? extracted2 : extracted2[0];
+    }
+
+    // Last resort: resp itself is an array of numbers for single input
+    if (!Array.isArray(text) && Array.isArray(resp) && typeof resp[0] === 'number') {
+      return resp as number[];
+    }
+
+    throw new Error('Unexpected Gemini embeddings response shape — check SDK docs or log full response.');
   } catch (err) {
+    // surface helpful error with some context
     throw new Error(`Gemini embedContent failed: ${getErrorMessage(err)}`);
   }
 }
 
 // ---------------------------
-// Indexing logic
+// Indexing logic with robust retry/backoff/jitter + logging
 // ---------------------------
+
 const output = vscode.window.createOutputChannel('Semantic Search');
 
 async function indexWorkspace(
@@ -231,6 +225,7 @@ async function indexWorkspace(
   const total = uris.length;
   let processed = 0;
 
+  // Build chunks
   for (const uri of uris) {
     if (token.isCancellationRequested) break;
     try {
@@ -246,14 +241,15 @@ async function indexWorkspace(
       output.appendLine(`Error reading file ${uri.fsPath}: ${getErrorMessage(e)}`);
     }
     processed++;
-    progress.report({ message: `Indexing ${uri.fsPath}`, increment: (processed / total) * 50 });
+    // progress increment logic: cap to 50% for scanning phase
+    progress.report({ message: `Indexing ${uri.fsPath}`, increment: (processed / Math.max(1, total)) * 50 });
   }
 
   output.appendLine(`Created ${vectorStore.size()} chunks. Starting embedding...`);
 
   const items = vectorStore.items;
-  const BATCH_SIZE = 25; // reduced for better reliability
-  const MODEL = 'gemini-embedding-001';
+  const BATCH_SIZE = 20; // safer batch size per typical rate limits
+  const maxAttempts = 6;
 
   for (let i = 0; i < items.length; i += BATCH_SIZE) {
     if (token.isCancellationRequested) break;
@@ -263,49 +259,52 @@ async function indexWorkspace(
 
     let embeddings: number[][] | null = null;
     let attempt = 0;
-    const maxAttempts = 5;
 
     while (attempt < maxAttempts) {
       try {
-        const client = await initGenAI(context);
-        output.appendLine(`Embedding batch ${i / BATCH_SIZE + 1} of ${Math.ceil(items.length / BATCH_SIZE)}...`);
-        
-        const resp: any = await (client as any).models.embedContent({
-          model: MODEL,
-          contents: texts
-        });
-
-        const extracted = Array.isArray(resp.embeddings) ? resp.embeddings : resp.data?.map((d: any) => d.embedding?.values || d.embedding);
-        if (!extracted || !Array.isArray(extracted[0])) throw new Error('Invalid embedding format');
-        
-        embeddings = extracted as number[][];
-        break;
-
-      } catch (err: any) {
         attempt++;
-        const statusCode = err?.status || err?.code || 'unknown';
-        output.appendLine(`Error embedding batch ${i / BATCH_SIZE + 1}: ${getErrorMessage(err)} (status: ${statusCode}), attempt ${attempt}/${maxAttempts}`);
-
+        output.appendLine(`Embedding batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(items.length / BATCH_SIZE)} (attempt ${attempt})`);
+        const resp = await getEmbedding(texts, context); // will return number[][] on success
+        if (Array.isArray(resp) && Array.isArray(resp[0])) {
+          embeddings = resp as number[][];
+          break;
+        } else {
+          throw new Error('Unexpected embedding return shape (not number[][])');
+        }
+      } catch (err) {
+        const msg = getErrorMessage(err);
+        output.appendLine(`Error embedding batch ${Math.floor(i / BATCH_SIZE) + 1}: ${msg}`);
+        // If we hit final attempt, record and continue
         if (attempt >= maxAttempts) {
-          output.appendLine(`Giving up on batch ${i / BATCH_SIZE + 1}.`);
+          output.appendLine(`Giving up on batch ${Math.floor(i / BATCH_SIZE) + 1} after ${attempt} attempts.`);
           break;
         }
-
-        const waitMs = Math.pow(2, attempt) * 500 + Math.random() * 300; // backoff + jitter
-        output.appendLine(`Retrying in ${waitMs.toFixed(0)}ms...`);
-        await new Promise(res => setTimeout(res, waitMs));
+        // Determine backoff: exponential * 500ms + jitter
+        const backoffMs = Math.pow(2, attempt) * 500 + Math.floor(Math.random() * 500);
+        output.appendLine(`Retrying in ${backoffMs}ms...`);
+        await new Promise(res => setTimeout(res, backoffMs));
       }
     }
 
+    // Attach embeddings (if available) otherwise null
     if (embeddings) {
-      batch.forEach((b, idx) => {
-        b.embedding = embeddings![idx] || null;
-      });
+      for (let j = 0; j < batch.length; j++) {
+        batch[j].embedding = embeddings[j] || null;
+      }
+    } else {
+      for (const b of batch) b.embedding = null;
     }
 
-    progress.report({ message: `Embedding chunks ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}`, increment: 50 / Math.ceil(items.length / BATCH_SIZE) });
+    // report progress for embedding phase (remaining 50% split across batches)
+    const batchesTotal = Math.max(1, Math.ceil(items.length / BATCH_SIZE));
+    const currentBatchIndex = Math.floor(i / BATCH_SIZE);
+    const embeddingProgressIncrement = 50 / batchesTotal;
+    progress.report({
+      message: `Embedding chunks ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}`,
+      increment: embeddingProgressIncrement
+    });
 
-    // Small delay to avoid hitting rate limits
+    // throttle between batches to reduce bursts
     await new Promise(res => setTimeout(res, 200));
   }
 
@@ -318,7 +317,7 @@ async function indexWorkspace(
 // ---------------------------
 
 export async function activate(context: vscode.ExtensionContext) {
-  console.log('semantic-code-search: activated');
+  output.appendLine('Activating semantic-code-search extension');
 
   const indexCommand = vscode.commands.registerCommand('semanticSearch.indexWorkspace', async () => {
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Indexing workspace for semantic search', cancellable: true }, async (p, token) => {
@@ -411,7 +410,7 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-  console.log('semantic-code-search: deactivated');
+  output.appendLine('semantic-code-search: deactivated');
 }
 
 // small helpers
@@ -420,23 +419,17 @@ function truncate(s: string, n: number) {
 }
 
 /*
-  NOTES:
-  - Ensure your package.json contributes the commands and activationEvents:
-    "activationEvents": [
-      "onCommand:semanticSearch.indexWorkspace",
-      "onCommand:semanticSearch.query",
-      "onCommand:semanticSearch.clearIndex",
-      "onCommand:semanticSearch.showStats",
-      "onCommand:semanticSearch.setApiKey"
-    ],
-    and include corresponding contributes.commands entries.
+  Notes & troubleshooting:
 
-  - Install SDK:
-      npm install @google/genai
+  - The Gemini docs show using `client.models.embedContent({ model: 'gemini-embedding-001', contents })`
+    and that responses include `response.embeddings`, where each embedding entry exposes `.values`.
+    This file extracts embeddings via resp.embeddings.map(e => e.values).
 
-  - For local dev you can also set:
-      export GOOGLE_API_KEY="..."   (or on Windows: setx GOOGLE_API_KEY "...")
-    or run the Set API Key command inside the Extension Development Host.
+  - If you see `fetch failed sending request`:
+    * Ensure Node >= 18 (fetch availability) in your dev environment that runs the extension.
+    * Check network/proxy/SSL; the SDK uses fetch under the hood.
+    * Add more logging by inspecting the full error message in the Output channel.
 
-  - Tweak BATCH_SIZE and embedding config according to rate limits and costs.
+  - Adjust BATCH_SIZE and backoff parameters depending on your observed rate limits.
+  - To switch to the other stable model (`textembedding-gecko@003`), replace MODEL constant in getEmbedding.
 */
