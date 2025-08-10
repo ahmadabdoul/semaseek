@@ -213,14 +213,21 @@ export async function getEmbedding(text: string | string[], context?: vscode.Ext
 // ---------------------------
 // Indexing logic
 // ---------------------------
+const output = vscode.window.createOutputChannel('Semantic Search');
 
-async function indexWorkspace(progress: vscode.Progress<{ message?: string; increment?: number }>, token: vscode.CancellationToken, context?: vscode.ExtensionContext) {
+async function indexWorkspace(
+  progress: vscode.Progress<{ message?: string; increment?: number }>,
+  token: vscode.CancellationToken,
+  context?: vscode.ExtensionContext
+) {
   vectorStore.clear();
+  output.clear();
+  output.appendLine('Starting workspace indexing...');
 
-  // Adjust glob as desired
   const fileGlob = '**/*.{js,ts,jsx,tsx,py,java,go,rs,md}';
   const uris = await vscode.workspace.findFiles(fileGlob, '**/node_modules/**');
 
+  output.appendLine(`Found ${uris.length} files matching pattern.`);
   const total = uris.length;
   let processed = 0;
 
@@ -236,51 +243,74 @@ async function indexWorkspace(progress: vscode.Progress<{ message?: string; incr
         vectorStore.add(chunk);
       }
     } catch (e) {
-      // ignore file read errors
+      output.appendLine(`Error reading file ${uri.fsPath}: ${getErrorMessage(e)}`);
     }
     processed++;
-    const pct = total > 0 ? Math.floor((processed / total) * 100) : 100;
-    progress.report({ message: `Indexing ${uri.fsPath} (${processed}/${total})`, increment: pct });
+    progress.report({ message: `Indexing ${uri.fsPath}`, increment: (processed / total) * 50 });
   }
 
-  // Batch-create embeddings using getEmbedding(texts, context)
+  output.appendLine(`Created ${vectorStore.size()} chunks. Starting embedding...`);
+
   const items = vectorStore.items;
-  const BATCH_SIZE = 20; // tune to your rate limits and memory
+  const BATCH_SIZE = 25; // reduced for better reliability
+  const MODEL = 'gemini-embedding-001';
+
   for (let i = 0; i < items.length; i += BATCH_SIZE) {
     if (token.isCancellationRequested) break;
+
     const batch = items.slice(i, i + BATCH_SIZE);
     const texts = batch.map(b => b.text);
 
-    const maxAttempts = 3;
+    let embeddings: number[][] | null = null;
     let attempt = 0;
-    let embeddings: number[][] | number[] | null = null;
+    const maxAttempts = 5;
+
     while (attempt < maxAttempts) {
       try {
-        const resp = await getEmbedding(texts, context);
-        embeddings = resp as any;
+        const client = await initGenAI(context);
+        output.appendLine(`Embedding batch ${i / BATCH_SIZE + 1} of ${Math.ceil(items.length / BATCH_SIZE)}...`);
+        
+        const resp: any = await (client as any).models.embedContent({
+          model: MODEL,
+          contents: texts
+        });
+
+        const extracted = Array.isArray(resp.embeddings) ? resp.embeddings : resp.data?.map((d: any) => d.embedding?.values || d.embedding);
+        if (!extracted || !Array.isArray(extracted[0])) throw new Error('Invalid embedding format');
+        
+        embeddings = extracted as number[][];
         break;
-      } catch (err) {
+
+      } catch (err: any) {
         attempt++;
-        const waitMs = Math.pow(2, attempt) * 1000;
-        await new Promise((res) => setTimeout(res, waitMs));
+        const statusCode = err?.status || err?.code || 'unknown';
+        output.appendLine(`Error embedding batch ${i / BATCH_SIZE + 1}: ${getErrorMessage(err)} (status: ${statusCode}), attempt ${attempt}/${maxAttempts}`);
+
         if (attempt >= maxAttempts) {
-          console.error('Failed to fetch embeddings for batch:', getErrorMessage(err));
+          output.appendLine(`Giving up on batch ${i / BATCH_SIZE + 1}.`);
+          break;
         }
+
+        const waitMs = Math.pow(2, attempt) * 500 + Math.random() * 300; // backoff + jitter
+        output.appendLine(`Retrying in ${waitMs.toFixed(0)}ms...`);
+        await new Promise(res => setTimeout(res, waitMs));
       }
     }
 
-    if (Array.isArray(embeddings) && Array.isArray(embeddings[0])) {
-      for (let j = 0; j < batch.length; j++) {
-        batch[j].embedding = (embeddings as number[][])[j] || null;
-      }
-    } else if (Array.isArray(embeddings) && typeof (embeddings as any)[0] === 'number' && batch.length === 1) {
-      batch[0].embedding = embeddings as number[];
-    } else {
-      for (const b of batch) b.embedding = null;
+    if (embeddings) {
+      batch.forEach((b, idx) => {
+        b.embedding = embeddings![idx] || null;
+      });
     }
 
-    progress.report({ message: `Embedding chunks ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}` });
+    progress.report({ message: `Embedding chunks ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}`, increment: 50 / Math.ceil(items.length / BATCH_SIZE) });
+
+    // Small delay to avoid hitting rate limits
+    await new Promise(res => setTimeout(res, 200));
   }
+
+  output.appendLine('Indexing complete.');
+  output.show(true);
 }
 
 // ---------------------------
