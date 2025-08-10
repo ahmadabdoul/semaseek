@@ -1,13 +1,13 @@
 /**
-  semantic-code-search - VS Code extension (accuracy + sqlite improvements)
+  extension.reindex-prompt.ts - semantic-code-search (full, day-1 starter)
 
-  Key fixes:
-  - setting semanticSearch.embeddingModel (defaults to textembedding-gecko@003)
-  - store model + dim in DB meta table and warn on mismatch
-  - L2-normalize embeddings before persisting & on query
-  - persist to async sqlite3 (batched transaction)
-  - JSON fallback if sqlite3 absent
-  - lexical boosting (simple substring boost) to improve ranking
+  - Uses Gemini embeddings via @google/genai (configurable model)
+  - L2-normalizes embeddings for stable cosine search
+  - Persists to async sqlite3 with JSON fallback
+  - Stores meta (model + dim) and prompts to Reindex when mismatch detected
+  - Commands: indexWorkspace, query, clearIndex, showStats, setApiKey
+
+  NOTES: add configuration entries to package.json (see bottom comment).
 */
 
 import * as vscode from 'vscode';
@@ -18,7 +18,7 @@ import { GoogleGenAI } from '@google/genai';
 let genaiClient: GoogleGenAI | null = null;
 let db: any = null; // sqlite3 Database instance
 let usingSqlite = false;
-let rawSqlite: any = null; // the sqlite3 module if loaded
+let rawSqlite: any = null; // sqlite3 module
 
 // ---------------------------
 // Config helpers
@@ -30,12 +30,12 @@ function getConfig() {
     embeddingModel: conf.get<string>('embeddingModel', 'gemini-embedding-001'),
     batchSize: conf.get<number>('batchSize', 20),
     saveEveryBatches: conf.get<number>('saveEveryBatches', 5),
-    lexicalBoostWeight: conf.get<number>('lexicalBoostWeight', 0.15) // small lexical boost
+    lexicalBoostWeight: conf.get<number>('lexicalBoostWeight', 0.12)
   };
 }
 
 // ---------------------------
-// Simple in-memory vector store
+// In-memory vector store
 // ---------------------------
 
 type DocChunk = {
@@ -50,35 +50,17 @@ type DocChunk = {
 class InMemoryVectorStore {
   public items: DocChunk[] = [];
 
-  add(chunk: DocChunk) {
-    this.items.push(chunk);
-  }
+  add(chunk: DocChunk) { this.items.push(chunk); }
+  clear() { this.items = []; }
+  size() { return this.items.length; }
 
-  clear() {
-    this.items = [];
-  }
-
-  size() {
-    return this.items.length;
-  }
-
-  async searchByEmbedding(embedding: number[], topK = 10, lexicalBoostWeight = 0.15) {
-    // assume embedding is already normalized
+  // simple cosine similarity search
+  async searchByEmbedding(qEmb: number[], topK = 10) {
     const scored = this.items
-      .filter(i => i.embedding && i.embedding.length === embedding.length)
-      .map(i => {
-        const semScore = cosineSimilarity(i.embedding! as number[], embedding);
-        // lexical boost: 1 if query substring in text else 0 (very cheap)
-        const lexScore = 0; // caller can handle lexical boost via second step
-        return { item: i, score: semScore, lex: lexScore };
-      })
-      .map(s => ({
-        item: s.item,
-        score: s.score // lex boosting handled later where query text is known
-      }))
+      .filter(i => i.embedding && i.embedding.length === qEmb.length)
+      .map(i => ({ item: i, score: cosineSimilarity(i.embedding! as number[], qEmb) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, topK);
-
     return scored;
   }
 }
@@ -136,7 +118,7 @@ function normalizeEmbeddingResult(res: number[] | number[][]): number[] {
 }
 
 // ---------------------------
-// GenAI client + embedding (use configured model)
+// GenAI (Gemini) client + embedding
 // ---------------------------
 
 async function initGenAI(context?: vscode.ExtensionContext) {
@@ -144,12 +126,16 @@ async function initGenAI(context?: vscode.ExtensionContext) {
   let apiKey: string | undefined;
   try { if (context?.secrets) apiKey = (await context.secrets.get('GOOGLE_API_KEY')) || undefined; } catch {}
   if (!apiKey && (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY)) apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('Google API key not found. Run Semantic Search: Set API Key or set GOOGLE_API_KEY env var.');
+  if (!apiKey) throw new Error('Google API key not found. Use command "Semantic Search: Set API Key" or set env GOOGLE_API_KEY.');
   const ai = new GoogleGenAI({ apiKey });
   genaiClient = ai;
   return genaiClient;
 }
 
+/**
+ * getEmbedding: uses configured model (defaults to textembedding-gecko@003)
+ * Returns normalized vectors (number[] or number[][])
+ */
 export async function getEmbedding(text: string | string[], context?: vscode.ExtensionContext): Promise<number[] | number[][]> {
   const client = await initGenAI(context);
   const contents = Array.isArray(text) ? text : [text];
@@ -157,38 +143,39 @@ export async function getEmbedding(text: string | string[], context?: vscode.Ext
   const TASK = 'SEMANTIC_SIMILARITY';
 
   try {
+    // call embedContent per Gemini docs — SDK shapes vary between versions, parse defensively
     const resp: any = await (client as any).models.embedContent({ model: MODEL, contents, taskType: TASK });
 
-    // prefer resp.embeddings[].values per Gemini docs
+    // common shape: resp.embeddings -> [{values: [...]}, ...]
     if (Array.isArray(resp?.embeddings) && resp.embeddings.length > 0) {
       const extracted = resp.embeddings.map((e: any) => {
         if (Array.isArray(e?.values)) return e.values as number[];
         if (Array.isArray(e?.embedding?.values)) return e.embedding.values as number[];
         if (Array.isArray(e?.embedding)) return e.embedding as number[];
-        if (Array.isArray(e?.values)) return e.values as number[];
         if (Array.isArray(e)) return e as number[];
         throw new Error('Unexpected embedding entry shape');
       });
-      // normalize before returning (consistent representation)
-      const normalized = extracted.map((v: number[]) => l2Normalize(v));
+      const normalized = extracted.map((v: any[]) => l2Normalize(v.map(n => Number(n))));
       return Array.isArray(text) ? normalized : normalized[0];
     }
 
-    // fallback shapes
+    // fallback: resp.data -> [{embedding: {values: [...]}}]
     if (Array.isArray(resp?.data) && resp.data.length > 0) {
       const extracted2 = resp.data.map((d: any) => {
         if (Array.isArray(d?.embedding?.values)) return d.embedding.values as number[];
         if (Array.isArray(d?.embedding)) return d.embedding as number[];
-        if (Array.isArray(d?.values)) return d.values as number[];
+        if (Array.isArray(d)) return d as number[];
         throw new Error('Unexpected data.embedding shape');
       });
-      const normalized = extracted2.map((v: number[]) => l2Normalize(v));
+      const normalized = extracted2.map((v: any[]) => l2Normalize(v.map(n => Number(n))));
       return Array.isArray(text) ? normalized : normalized[0];
     }
 
+    // last attempt: resp itself is a vector
     if (!Array.isArray(text) && Array.isArray(resp) && typeof resp[0] === 'number') {
-      return l2Normalize(resp as number[]);
+      return l2Normalize((resp as number[]).map(n => Number(n)));
     }
+
     throw new Error('Unexpected embeddings response shape');
   } catch (err) {
     throw new Error(`Gemini embedContent failed: ${getErrorMessage(err)}`);
@@ -196,26 +183,20 @@ export async function getEmbedding(text: string | string[], context?: vscode.Ext
 }
 
 // ---------------------------
-// Async sqlite3 persistence (with meta table)
+// Async sqlite3 persistence (with meta)
 // ---------------------------
 
 const INDEX_DB_NAME = 'semantic_index.sqlite3';
 
 function dbRunAsync(sql: string, params: any[] = []): Promise<void> {
   return new Promise((res, rej) => {
-    db.run(sql, params, function (err: any) {
-      if (err) return rej(err);
-      res();
-    });
+    db.run(sql, params, function (err: any) { if (err) return rej(err); res(); });
   });
 }
 
 function dbAllAsync(sql: string, params: any[] = []): Promise<any[]> {
   return new Promise((res, rej) => {
-    db.all(sql, params, (err: any, rows: any[]) => {
-      if (err) return rej(err);
-      res(rows);
-    });
+    db.all(sql, params, (err: any, rows: any[]) => { if (err) return rej(err); res(rows); });
   });
 }
 
@@ -223,21 +204,16 @@ async function initDatabase(context: vscode.ExtensionContext) {
   const conf = getConfig();
   if (!conf.persistToSqlite) {
     output.appendLine('SQLite persistence disabled by config');
-    usingSqlite = false;
-    return;
+    usingSqlite = false; return;
   }
 
-  try {
-    rawSqlite = require('sqlite3').verbose();
-  } catch (e) {
+  try { rawSqlite = require('sqlite3').verbose(); } catch (e) {
     output.appendLine('sqlite3 not installed — falling back to JSON persistence. Install with: npm i sqlite3');
-    usingSqlite = false;
-    return;
+    usingSqlite = false; return;
   }
 
   try {
-    const dir = context.globalStorageUri.fsPath;
-    await fs.mkdir(dir, { recursive: true });
+    const dir = context.globalStorageUri.fsPath; await fs.mkdir(dir, { recursive: true });
     const dbPath = path.join(dir, INDEX_DB_NAME);
     db = new rawSqlite.Database(dbPath);
     await new Promise<void>((res, rej) => db.run("PRAGMA journal_mode = WAL;", (err: any) => err ? rej(err) : res()));
@@ -252,63 +228,37 @@ async function initDatabase(context: vscode.ExtensionContext) {
     await new Promise<void>((res, rej) => db.run(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);`, (err: any) => err ? rej(err) : res()));
     await new Promise<void>((res, rej) => db.run(`CREATE INDEX IF NOT EXISTS idx_chunks_uri ON chunks(uri);`, (err: any) => err ? rej(err) : res()));
 
-    usingSqlite = true;
-    output.appendLine(`SQLite DB initialized at ${dbPath}`);
-  } catch (err) {
-    output.appendLine('Failed to initialize sqlite DB: ' + getErrorMessage(err));
-    usingSqlite = false;
-  }
+    usingSqlite = true; output.appendLine(`SQLite DB initialized at ${dbPath}`);
+  } catch (err) { output.appendLine('Failed to initialize sqlite DB: ' + getErrorMessage(err)); usingSqlite = false; }
 }
 
-async function setMeta(key: string, value: string) {
-  if (!usingSqlite || !db) return;
-  await dbRunAsync('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)', [key, value]);
-}
-
-async function getMeta(key: string): Promise<string | null> {
-  if (!usingSqlite || !db) return null;
-  const rows = await dbAllAsync('SELECT v FROM meta WHERE k = ?', [key]);
-  if (!rows || rows.length === 0) return null;
-  return rows[0].v;
-}
+async function setMeta(key: string, value: string) { if (!usingSqlite || !db) return; await dbRunAsync('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)', [key, value]); }
+async function getMeta(key: string): Promise<string | null> { if (!usingSqlite || !db) return null; const rows = await dbAllAsync('SELECT v FROM meta WHERE k = ?', [key]); if (!rows || rows.length === 0) return null; return rows[0].v; }
 
 async function saveBatchToDB(batch: DocChunk[], context?: vscode.ExtensionContext) {
   if (!usingSqlite || !db) return;
   try {
-    // transactional insert using a prepared statement (faster)
     await dbRunAsync('BEGIN TRANSACTION');
     const insertSql = 'INSERT OR REPLACE INTO chunks (id, uri, start, end, text, embedding) VALUES (?, ?, ?, ?, ?, ?)';
-    // prepare + run pattern using statement -> wrap in Promise
     await new Promise<void>((resolve, reject) => {
       const stmt = db.prepare(insertSql);
       let i = 0;
       function runNext() {
-        if (i >= batch.length) {
-          stmt.finalize((err: any) => err ? reject(err) : resolve());
-          return;
-        }
+        if (i >= batch.length) { stmt.finalize((err: any) => err ? reject(err) : resolve()); return; }
         const r = batch[i++];
         const emb = r.embedding ? JSON.stringify(r.embedding) : null;
-        stmt.run([r.id, r.uri, r.start, r.end, r.text, emb], (err: any) => {
-          if (err) return reject(err);
-          runNext();
-        });
+        stmt.run([r.id, r.uri, r.start, r.end, r.text, emb], (err: any) => { if (err) return reject(err); runNext(); });
       }
       runNext();
     });
     await dbRunAsync('COMMIT');
 
-    // If model meta not set, set it using current config model and dim
+    // save meta if missing
     const modelMeta = await getMeta('model');
     if (!modelMeta && context) {
       const conf = getConfig();
-      // infer dim from first saved embedding if present
       const firstDim = batch.find(b => Array.isArray(b.embedding) && b.embedding.length > 0)?.embedding?.length ?? null;
-      if (firstDim) {
-        await setMeta('model', conf.embeddingModel);
-        await setMeta('dim', String(firstDim));
-        output.appendLine(`Saved meta model=${conf.embeddingModel} dim=${firstDim}`);
-      }
+      if (firstDim) { await setMeta('model', conf.embeddingModel); await setMeta('dim', String(firstDim)); output.appendLine(`Saved meta model=${conf.embeddingModel} dim=${firstDim}`); }
     }
 
     output.appendLine(`Saved ${batch.length} chunks to sqlite DB`);
@@ -327,28 +277,34 @@ async function loadIndexFromDB(context: vscode.ExtensionContext) {
       for (const r of rows) {
         const embedding = r.embedding ? JSON.parse(r.embedding) : null;
         if (!embedding) nullEmbCount++;
-        // ensure numeric arrays and normalized
         const normalizedEmbedding = Array.isArray(embedding) ? l2Normalize(embedding.map((n: any) => Number(n))) : null;
         vectorStore.add({ id: r.id, uri: r.uri, start: r.start, end: r.end, text: r.text, embedding: normalizedEmbedding });
       }
       output.appendLine(`Loaded ${vectorStore.size()} chunks from sqlite DB (null embeddings: ${nullEmbCount})`);
 
-      // check meta model vs config model
+      // check meta
       const modelMeta = await getMeta('model');
       const dimMeta = await getMeta('dim');
       const conf = getConfig();
       if (modelMeta && modelMeta !== conf.embeddingModel) {
-        vscode.window.showWarningMessage(`Semantic index was built with embedding model "${modelMeta}" but current setting is "${conf.embeddingModel}". This can reduce search accuracy. Consider reindexing (Semantic Search: Index Workspace).`);
-        output.appendLine(`Warning: model mismatch: index=${modelMeta} current=${conf.embeddingModel}`);
+        output.appendLine(`Model mismatch detected (index=${modelMeta} current=${conf.embeddingModel}). Prompting user to reindex.`);
+        const pick = await vscode.window.showInformationMessage(
+          `Semantic index was built with embedding model "${modelMeta}" but current setting is "${conf.embeddingModel}". Reindex workspace now?`,
+          'Reindex', 'Ignore'
+        );
+        if (pick === 'Reindex') {
+          try { await vscode.commands.executeCommand('semanticSearch.indexWorkspace'); } catch (err) { output.appendLine('Failed to start reindex: ' + getErrorMessage(err)); }
+        }
       }
+
       if (dimMeta) {
         const dimNum = Number(dimMeta);
-        // check dimensionality of first non-null embedding
         const firstEmb = vectorStore.items.find(i => Array.isArray(i.embedding) && i.embedding.length > 0)?.embedding;
         if (firstEmb && firstEmb.length !== dimNum) {
           output.appendLine(`Warning: meta dim=${dimNum} but first embedding length=${firstEmb.length}`);
         }
       }
+
       return true;
     } catch (err) {
       output.appendLine('Failed to load index from sqlite DB: ' + getErrorMessage(err));
@@ -360,45 +316,26 @@ async function loadIndexFromDB(context: vscode.ExtensionContext) {
 
 async function clearDB(context: vscode.ExtensionContext) {
   if (usingSqlite && db) {
-    try {
-      await dbRunAsync('DELETE FROM chunks');
-      await dbRunAsync('DELETE FROM meta');
-      output.appendLine('Cleared sqlite DB chunks and meta');
-    } catch (err) {
-      output.appendLine('Failed to clear sqlite DB: ' + getErrorMessage(err));
-    }
+    try { await dbRunAsync('DELETE FROM chunks'); await dbRunAsync('DELETE FROM meta'); output.appendLine('Cleared sqlite DB chunks and meta'); } catch (err) { output.appendLine('Failed to clear sqlite DB: ' + getErrorMessage(err)); }
   } else {
-    try {
-      const filePath = path.join(context.globalStorageUri.fsPath, 'semantic_index.json');
-      await fs.unlink(filePath).catch(() => {});
-      output.appendLine('Cleared JSON persisted index (fallback)');
-    } catch (err) {
-      output.appendLine('Failed to remove persisted JSON index: ' + getErrorMessage(err));
-    }
+    try { const filePath = path.join(context.globalStorageUri.fsPath, 'semantic_index.json'); await fs.unlink(filePath).catch(() => {}); output.appendLine('Cleared JSON persisted index (fallback)'); } catch (err) { output.appendLine('Failed to remove persisted JSON index: ' + getErrorMessage(err)); }
   }
 }
 
 // ---------------------------
-// Indexing logic (uses sqlite persistence, normalizes and saves meta)
+// Indexing
 // ---------------------------
 
 async function indexWorkspace(progress: vscode.Progress<{ message?: string; increment?: number }>, token: vscode.CancellationToken, context?: vscode.ExtensionContext) {
-  vectorStore.clear();
-  output.clear();
-  output.appendLine('Starting workspace indexing...');
-
-  if (!context) throw new Error('Extension context missing for indexing');
-
+  vectorStore.clear(); output.clear(); output.appendLine('Starting workspace indexing...');
+  if (!context) throw new Error('Extension context required');
   await initDatabase(context);
 
   const fileGlob = '**/*.{js,ts,jsx,tsx,py,java,go,rs,md}';
   const uris = await vscode.workspace.findFiles(fileGlob, '**/node_modules/**');
-
   output.appendLine(`Found ${uris.length} files.`);
-  const total = uris.length;
-  let processed = 0;
+  const total = uris.length; let processed = 0;
 
-  // Build chunks
   for (const uri of uris) {
     if (token.isCancellationRequested) break;
     try {
@@ -410,9 +347,7 @@ async function indexWorkspace(progress: vscode.Progress<{ message?: string; incr
         const chunk: DocChunk = { id, uri: uri.toString(), start: c.start, end: c.end, text: c.text, embedding: null };
         vectorStore.add(chunk);
       }
-    } catch (e) {
-      output.appendLine(`Error reading ${uri.fsPath}: ${getErrorMessage(e)}`);
-    }
+    } catch (e) { output.appendLine(`Error reading ${uri.fsPath}: ${getErrorMessage(e)}`); }
     processed++;
     progress.report({ message: `Indexing ${uri.fsPath}`, increment: (processed / Math.max(1, total)) * 50 });
   }
@@ -428,23 +363,19 @@ async function indexWorkspace(progress: vscode.Progress<{ message?: string; incr
 
   for (let i = 0, batchIdx = 0; i < items.length; i += BATCH_SIZE, batchIdx++) {
     if (token.isCancellationRequested) break;
-
     const batch = items.slice(i, i + BATCH_SIZE);
     const texts = batch.map(b => b.text);
-
     let embeddings: number[][] | null = null;
     let attempt = 0;
 
     while (attempt < maxAttempts) {
       try {
-        attempt++;
-        output.appendLine(`Embedding batch ${batchIdx + 1}/${totalBatches} (attempt ${attempt})`);
-        const resp = await getEmbedding(texts, context); // returns already-normalized number[][] per getEmbedding
+        attempt++; output.appendLine(`Embedding batch ${batchIdx + 1}/${totalBatches} (attempt ${attempt})`);
+        const resp = await getEmbedding(texts, context);
         if (Array.isArray(resp) && Array.isArray(resp[0])) { embeddings = resp as number[][]; break; }
         throw new Error('Unexpected embedding shape');
       } catch (err) {
-        const msg = getErrorMessage(err);
-        output.appendLine(`Error embedding batch ${batchIdx + 1}: ${msg}`);
+        const msg = getErrorMessage(err); output.appendLine(`Error embedding batch ${batchIdx + 1}: ${msg}`);
         if (attempt >= maxAttempts) { output.appendLine(`Giving up on batch ${batchIdx + 1}`); break; }
         const backoffMs = Math.pow(2, attempt) * 500 + Math.floor(Math.random() * 500);
         output.appendLine(`Retrying in ${backoffMs}ms...`);
@@ -452,43 +383,25 @@ async function indexWorkspace(progress: vscode.Progress<{ message?: string; incr
       }
     }
 
-    if (embeddings) {
-      for (let j = 0; j < batch.length; j++) {
-        // ensure normalized numeric array (double-protect)
-        batch[j].embedding = Array.isArray(embeddings[j]) ? l2Normalize(embeddings[j].map(n => Number(n))) : null;
-      }
-    } else {
-      for (const b of batch) b.embedding = null;
-    }
+    if (embeddings) for (let j = 0; j < batch.length; j++) batch[j].embedding = Array.isArray(embeddings[j]) ? l2Normalize(embeddings[j].map(n => Number(n))) : null;
+    else for (const b of batch) b.embedding = null;
 
-    // persist periodically
     if (batchIdx % SAVE_EVERY === 0) {
       if (usingSqlite && db) await saveBatchToDB(batch, context);
       else if (context) {
-        try {
-          const dir = context.globalStorageUri.fsPath; await fs.mkdir(dir, { recursive: true });
-          const filePath = path.join(dir, 'semantic_index.json');
-          // JSON stringify may be large — store embeddings as arrays (already normalized)
-          await fs.writeFile(filePath, JSON.stringify(vectorStore.items, null, 0), 'utf8');
-          output.appendLine(`Saved JSON fallback to ${filePath}`);
-        } catch (err) { output.appendLine('Failed JSON save: ' + getErrorMessage(err)); }
+        try { const dir = context.globalStorageUri.fsPath; await fs.mkdir(dir, { recursive: true }); const filePath = path.join(dir, 'semantic_index.json'); await fs.writeFile(filePath, JSON.stringify(vectorStore.items, null, 0), 'utf8'); output.appendLine(`Saved JSON fallback to ${filePath}`); } catch (err) { output.appendLine('Failed JSON save: ' + getErrorMessage(err)); }
       }
     }
 
     const embeddingProgressIncrement = 50 / totalBatches;
     progress.report({ message: `Embedding chunks ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}`, increment: embeddingProgressIncrement });
-    await new Promise(res => setTimeout(res, 200)); // throttle
+    await new Promise(res => setTimeout(res, 200));
   }
 
-  // final persist
-  if (usingSqlite && db) {
-    try { await dbRunAsync('PRAGMA wal_checkpoint(PASSIVE);'); } catch {}
-  } else if (context) {
-    try { const dir = context.globalStorageUri.fsPath; await fs.mkdir(dir, { recursive: true }); const filePath = path.join(dir, 'semantic_index.json'); await fs.writeFile(filePath, JSON.stringify(vectorStore.items, null, 0), 'utf8'); output.appendLine(`Final JSON saved to ${filePath}`); } catch (err) { output.appendLine('Final JSON save failed: ' + getErrorMessage(err)); }
-  }
+  if (usingSqlite && db) { try { await dbRunAsync('PRAGMA wal_checkpoint(PASSIVE);'); } catch {} }
+  else if (context) { try { const dir = context.globalStorageUri.fsPath; await fs.mkdir(dir, { recursive: true }); const filePath = path.join(dir, 'semantic_index.json'); await fs.writeFile(filePath, JSON.stringify(vectorStore.items, null, 0), 'utf8'); output.appendLine(`Final JSON saved to ${filePath}`); } catch (err) { output.appendLine('Final JSON save failed: ' + getErrorMessage(err)); } }
 
-  output.appendLine('Indexing complete.');
-  output.show(true);
+  output.appendLine('Indexing complete.'); output.show(true);
 }
 
 // ---------------------------
@@ -498,33 +411,7 @@ async function indexWorkspace(progress: vscode.Progress<{ message?: string; incr
 export async function activate(context: vscode.ExtensionContext) {
   output.appendLine('Activating semantic-code-search extension');
 
-  try {
-    await fs.mkdir(context.globalStorageUri.fsPath, { recursive: true });
-    await initDatabase(context);
-    if (usingSqlite && db) {
-      await loadIndexFromDB(context);
-    } else {
-      // JSON fallback
-      try {
-        const filePath = path.join(context.globalStorageUri.fsPath, 'semantic_index.json');
-        const raw = await fs.readFile(filePath, 'utf8').catch(() => null);
-        if (raw) {
-          const items = JSON.parse(raw) as DocChunk[];
-          vectorStore.clear();
-          for (const it of items) {
-            const embedding = Array.isArray(it.embedding) ? l2Normalize(it.embedding.map((n: any) => Number(n))) : null;
-            vectorStore.add({ id: it.id, uri: it.uri, start: it.start, end: it.end, text: it.text, embedding });
-          }
-          output.appendLine(`Loaded ${vectorStore.size()} persisted chunks from JSON fallback`);
-        }
-      } catch (err) {
-        output.appendLine('No persisted JSON index loaded.');
-      }
-    }
-  } catch (err) {
-    output.appendLine('Error preparing storage: ' + getErrorMessage(err));
-  }
-
+  // Register commands first so reindex prompt can call them
   const indexCommand = vscode.commands.registerCommand('semanticSearch.indexWorkspace', async () => {
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Indexing workspace for semantic search', cancellable: true }, async (p, token) => {
       await indexWorkspace(p, token, context);
@@ -534,30 +421,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
   const queryCommand = vscode.commands.registerCommand('semanticSearch.query', async () => {
     if (vectorStore.size() === 0) {
-      const loaded = usingSqlite ? await loadIndexFromDB(context) : (async () => {
-        try {
-          const filePath = path.join(context.globalStorageUri.fsPath, 'semantic_index.json');
-          const raw = await fs.readFile(filePath, 'utf8').catch(() => null);
-          if (!raw) return false;
-          const items = JSON.parse(raw) as DocChunk[];
-          vectorStore.clear();
-          for (const it of items) {
-            const embedding = Array.isArray(it.embedding) ? l2Normalize(it.embedding.map((n: any) => Number(n))) : null;
-            vectorStore.add({ id: it.id, uri: it.uri, start: it.start, end: it.end, text: it.text, embedding });
-          }
-          output.appendLine(`Loaded ${vectorStore.size()} persisted chunks from JSON fallback`);
-          return true;
-        } catch (err) {
-          output.appendLine('Failed to load JSON fallback: ' + getErrorMessage(err));
-          return false;
-        }
-      })();
+      const loaded = usingSqlite ? await loadIndexFromDB(context) : (async () => { try { const filePath = path.join(context.globalStorageUri.fsPath, 'semantic_index.json'); const raw = await fs.readFile(filePath, 'utf8').catch(() => null); if (!raw) return false; const items = JSON.parse(raw) as DocChunk[]; vectorStore.clear(); for (const it of items) vectorStore.add(it); output.appendLine(`Loaded ${vectorStore.size()} persisted chunks from JSON fallback`); return true; } catch (err) { output.appendLine('Failed to load JSON fallback: ' + getErrorMessage(err)); return false; } })();
 
       if (!loaded) {
         const pick = await vscode.window.showInformationMessage('Index empty. Index workspace now?', 'Index', 'Cancel');
-        if (pick === 'Index') {
-          await vscode.commands.executeCommand('semanticSearch.indexWorkspace');
-        } else return;
+        if (pick === 'Index') { await vscode.commands.executeCommand('semanticSearch.indexWorkspace'); } else return;
       }
     }
 
@@ -567,12 +435,10 @@ export async function activate(context: vscode.ExtensionContext) {
     let qEmbRaw: number[] | number[][];
     try { qEmbRaw = await getEmbedding(q, context); } catch (err) { vscode.window.showErrorMessage('Failed to get query embedding: ' + getErrorMessage(err)); return; }
 
-    // ensure normalized vector
     const qEmb = l2Normalize(normalizeEmbeddingResult(qEmbRaw));
 
-    // combine semantic scoring and lexical boost
     const lexicalBoostWeight = getConfig().lexicalBoostWeight;
-    const results = (await vectorStore.searchByEmbedding(qEmb, 200)) // larger K then trim
+    const results = (await vectorStore.searchByEmbedding(qEmb, 200))
       .map(r => {
         const lex = q && r.item.text.toLowerCase().includes(q.toLowerCase()) ? 1 : 0;
         const finalScore = r.score + lexicalBoostWeight * lex;
@@ -581,18 +447,9 @@ export async function activate(context: vscode.ExtensionContext) {
       .sort((a, b) => b.finalScore - a.finalScore)
       .slice(0, 12);
 
-    if (results.length === 0) {
-      vscode.window.showInformationMessage('No matches found.');
-      return;
-    }
+    if (results.length === 0) { vscode.window.showInformationMessage('No matches found.'); return; }
 
-    const items = results.map(r => ({
-      label: `${(r.finalScore * 100).toFixed(1)}% — ${path.basename(r.item.uri)}`,
-      description: truncate(r.item.text.replace(/\s+/g, ' '), 200),
-      uri: r.item.uri,
-      start: r.item.start,
-      score: r.finalScore
-    }));
+    const items = results.map(r => ({ label: `${(r.finalScore * 100).toFixed(1)}% — ${path.basename(r.item.uri)}`, description: truncate(r.item.text.replace(/\s+/g, ' '), 200), uri: r.item.uri, start: r.item.start, score: r.finalScore }));
 
     const pick = await vscode.window.showQuickPick(items, { placeHolder: 'Select a match to open' });
     if (!pick) return;
@@ -622,11 +479,28 @@ export async function activate(context: vscode.ExtensionContext) {
   });
 
   context.subscriptions.push(indexCommand, queryCommand, clearCommand, statsCommand, setApiKeyCommand);
+
+  // load persisted index and prompt to reindex when necessary
+  try {
+    await fs.mkdir(context.globalStorageUri.fsPath, { recursive: true });
+    await initDatabase(context);
+    if (usingSqlite && db) { await loadIndexFromDB(context); }
+    else {
+      try {
+        const filePath = path.join(context.globalStorageUri.fsPath, 'semantic_index.json');
+        const raw = await fs.readFile(filePath, 'utf8').catch(() => null);
+        if (raw) {
+          const items = JSON.parse(raw) as DocChunk[];
+          vectorStore.clear();
+          for (const it of items) vectorStore.add(it);
+          output.appendLine(`Loaded ${vectorStore.size()} persisted chunks from JSON fallback`);
+        }
+      } catch (err) { output.appendLine('No persisted JSON index loaded.'); }
+    }
+  } catch (err) { output.appendLine('Error preparing storage: ' + getErrorMessage(err)); }
 }
 
-export function deactivate() {
-  output.appendLine('semantic-code-search: deactivated');
-  try { if (db) db.close(); } catch {}
-}
+export function deactivate() { output.appendLine('semantic-code-search: deactivated'); try { if (db) db.close(); } catch {} }
 
 function truncate(s: string, n: number) { return s.length <= n ? s : s.slice(0, n - 1) + '…'; }
+

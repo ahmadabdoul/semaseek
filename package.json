@@ -46,14 +46,20 @@
           "type": "boolean",
           "default": true,
           "description": "Persist semantic index to SQLite. If false, JSON fallback used."
+        },
+        "semanticSearch.embeddingModel": {
+          "type": "string",
+          "default": "gemini-embedding-001",
+          "description": "Embedding model to use for Gemini/GenAI. Change requires reindex."
+        },
+        "semanticSearch.batchSize": {
+          "type": "number",
+          "default": 20,
+          "description": "Batch size for embedding requests. Tune for rate limits/costs."
         }
       }
-    },
-    "semanticSearch.embeddingModel": {
-  "type": "string",
-  "default": "gemini-embedding-001",
-  "description": "Embedding model to use for Gemini/GenAI."
-}
+    }
+ 
   },
   "scripts": {
     "compile": "tsc -p .",
