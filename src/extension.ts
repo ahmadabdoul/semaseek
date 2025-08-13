@@ -1,3 +1,5 @@
+
+
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs/promises';
@@ -10,6 +12,17 @@ let db: any = null; // sqlite3 Database instance
 let usingSqlite = false;
 let rawSqlite: any = null; // the sqlite3 module if loaded
 let fileUpdateStatus: vscode.StatusBarItem | null = null;
+
+// ---------------------------
+// KEY SERVER CONFIG
+// ---------------------------
+// Replace this with your real server URL (no trailing slash recommended).
+const KEY_SERVER_URL = 'https://pottersheritage.com/semaseek/semaseek.php'; // <-- set to where keyserver_nodb.php lives
+const KEY_REFRESH_MARGIN_MS = 2 * 60 * 1000; // 2 minutes margin before expiry to refresh
+
+// in-memory cached API key (don't persist per request)
+let cachedApiKey: string | null = null;
+let cachedApiKeyExpiresAt: number | null = null;
 
 // ---------------------------
 // Simple in-memory vector store
@@ -103,18 +116,68 @@ function normalizeEmbeddingResult(res: number[] | number[][]): number[] {
 }
 
 // ---------------------------
-// GenAI client + embedding (per docs)
+// GenAI client + embedding (per docs) using key server
 // ---------------------------
 
 async function initGenAI(context?: vscode.ExtensionContext) {
-  if (genaiClient) return genaiClient;
-  let apiKey: string | undefined;
-  try { if (context?.secrets) apiKey = (await context.secrets.get('GOOGLE_API_KEY')) || undefined; } catch {}
-  if (!apiKey && (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY)) apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('Google API key not found. Run Semantic Search: Set API Key or set GOOGLE_API_KEY env var.');
-  const ai = new GoogleGenAI({ apiKey });
-  genaiClient = ai;
-  return genaiClient;
+  // if client exists and cached key still valid, reuse
+  const now = Date.now();
+  if (genaiClient && cachedApiKey && cachedApiKeyExpiresAt && cachedApiKeyExpiresAt > now + KEY_REFRESH_MARGIN_MS) {
+    return genaiClient;
+  }
+
+  // fetch key from key server
+  try {
+    const url = KEY_SERVER_URL.replace(/\/$/, '') + '/key';
+    const resp = await (globalThis as any).fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`/key returned ${resp.status}: ${text}`);
+    }
+
+    const body = await resp.json().catch(() => null);
+    if (!body || typeof body.apiKey !== 'string') {
+      throw new Error('Invalid /key response shape');
+    }
+
+    // parse expiry
+    let expiresAtNum = Date.now() + 15 * 60 * 1000;
+    if (body.expiresAt) {
+      const parsed = Date.parse(body.expiresAt);
+      if (!isNaN(parsed)) expiresAtNum = parsed;
+    }
+
+    // update in-memory cache
+    cachedApiKey = body.apiKey;
+    cachedApiKeyExpiresAt = expiresAtNum;
+
+    // create client with new key
+    const ai = new GoogleGenAI({ apiKey: cachedApiKey });
+    genaiClient = ai;
+    return genaiClient;
+  } catch (err) {
+    const msg = (err && (err as Error).message) ? (err as Error).message : String(err);
+    output.appendLine('Failed to fetch API key from key server: ' + msg);
+
+    // fallback to env var for developer use
+    let apiKey: string | undefined;
+    if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) {
+      apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
+    }
+    if (!apiKey) {
+      throw new Error('Failed to obtain API key from key server and no environment API key available.');
+    }
+    const ai = new GoogleGenAI({ apiKey });
+    genaiClient = ai;
+    // do not persist env key to SecretStorage per request
+    return genaiClient;
+  }
 }
 
 /**
@@ -645,4 +708,3 @@ export async function activate(context: vscode.ExtensionContext) {
 export function deactivate() { output.appendLine('semantic-code-search: deactivated'); try { if (db) db.close(); } catch {} }
 
 function truncate(s: string, n: number) { return s.length <= n ? s : s.slice(0, n - 1) + '…'; }
-
