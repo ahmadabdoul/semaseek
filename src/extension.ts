@@ -158,7 +158,7 @@ async function initGenAI(context?: vscode.ExtensionContext) {
     cachedApiKeyExpiresAt = expiresAtNum;
 
     // create client with new key
-    const ai = new GoogleGenAI({ apiKey: cachedApiKey });
+    const ai = new GoogleGenAI({ apiKey: cachedApiKey! });
     genaiClient = ai;
     return genaiClient;
   } catch (err) {
