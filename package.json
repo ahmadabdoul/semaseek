@@ -59,7 +59,6 @@
         }
       }
     }
- 
   },
   "scripts": {
     "compile": "tsc -p .",
@@ -76,6 +75,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.13.0",
+    "axios": "^1.11.0",
     "sqlite3": "^5.1.7"
   }
 }

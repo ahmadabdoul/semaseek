@@ -129,23 +129,21 @@ async function initGenAI(context?: vscode.ExtensionContext) {
   // fetch key from key server
   try {
     const url = KEY_SERVER_URL.replace(/\/$/, '') + '?action=key';
-    const resp = await (globalThis as any).fetch(url, {
-      method: 'GET',
+    console.log(url)
+    const resp = await (globalThis as any).axios.get(url, {
       headers: {
-        'Accept': 'application/json'
+      'Accept': 'application/json'
       }
     });
-
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
-      throw new Error(`/key returned ${resp.status}: ${text}`);
+    console.log(resp)
+    if (resp.status !== 200) {
+      throw new Error(`/key returned ${resp.status}: ${resp.data || ''}`);
     }
 
-    const body = await resp.json().catch(() => null);
+    const body = resp.data;
     if (!body || typeof body.apiKey !== 'string') {
-      throw new Error('Invalid /key response shape');
+      throw new Error(`Invalid /key response shape: ${JSON.stringify(body)}`);
     }
-
     // parse expiry
     let expiresAtNum = Date.now() + 15 * 60 * 1000;
     if (body.expiresAt) {
