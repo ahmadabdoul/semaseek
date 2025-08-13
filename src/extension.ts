@@ -17,7 +17,7 @@ let fileUpdateStatus: vscode.StatusBarItem | null = null;
 // KEY SERVER CONFIG
 // ---------------------------
 // Replace this with your real server URL (no trailing slash recommended).
-const KEY_SERVER_URL = 'https://pottersheritage.com/semaseek/semaseek.php'; // <-- set to where keyserver_nodb.php lives
+const KEY_SERVER_URL = 'https://pottersheritage.com/semaseek/semaseek.php/'; // <-- set to where keyserver_nodb.php lives
 const KEY_REFRESH_MARGIN_MS = 2 * 60 * 1000; // 2 minutes margin before expiry to refresh
 
 // in-memory cached API key (don't persist per request)
@@ -128,7 +128,7 @@ async function initGenAI(context?: vscode.ExtensionContext) {
 
   // fetch key from key server
   try {
-    const url = KEY_SERVER_URL.replace(/\/$/, '') + '/key';
+    const url = KEY_SERVER_URL.replace(/\/$/, '') + '?action=key';
     const resp = await (globalThis as any).fetch(url, {
       method: 'GET',
       headers: {
