@@ -1,4 +1,12 @@
+/**
+  extension.ts - semantic-code-search (uses key server for API key)
 
+  - Uses Gemini/embedContent via @google/genai
+  - L2-normalizes embeddings for stable cosine search
+  - Persists to async sqlite3 with JSON fallback
+  - Key is fetched from a simple remote key server (no secret header used here)
+  - File watcher + per-file status updates
+*/
 
 import * as vscode from 'vscode';
 import * as path from 'path';
@@ -17,7 +25,7 @@ let fileUpdateStatus: vscode.StatusBarItem | null = null;
 // KEY SERVER CONFIG
 // ---------------------------
 // Replace this with your real server URL (no trailing slash recommended).
-const KEY_SERVER_URL = 'https://pottersheritage.com/semaseek/semaseek.php/'; // <-- set to where keyserver_nodb.php lives
+const KEY_SERVER_URL = 'https://pottersheritage.com/semaseek/semaseek.php'; // <-- ensure no trailing slash
 const KEY_REFRESH_MARGIN_MS = 2 * 60 * 1000; // 2 minutes margin before expiry to refresh
 
 // in-memory cached API key (don't persist per request)
@@ -50,6 +58,14 @@ class InMemoryVectorStore {
 
   size() {
     return this.items.length;
+  }
+
+  removeByUri(uri: string) {
+    this.items = this.items.filter(i => i.uri !== uri);
+  }
+
+  removeById(id: string) {
+    this.items = this.items.filter(i => i.id !== id);
   }
 
   async searchByEmbedding(embedding: number[], topK = 10) {
@@ -120,7 +136,7 @@ function normalizeEmbeddingResult(res: number[] | number[][]): number[] {
 // ---------------------------
 
 async function initGenAI(context?: vscode.ExtensionContext) {
-  // if client exists and cached key still valid, reuse
+  // reuse existing client if key still valid
   const now = Date.now();
   if (genaiClient && cachedApiKey && cachedApiKeyExpiresAt && cachedApiKeyExpiresAt > now + KEY_REFRESH_MARGIN_MS) {
     return genaiClient;
@@ -128,34 +144,49 @@ async function initGenAI(context?: vscode.ExtensionContext) {
 
   // fetch key from key server
   try {
-    const url = KEY_SERVER_URL.replace(/\/$/, '') + '?action=key';
-    console.log(url)
-    const resp = await (globalThis as any).axios.get(url, {
-      headers: {
-      'Accept': 'application/json'
-      }
+    const base = KEY_SERVER_URL.replace(/\/+$/, '');
+    const url = `${base}?action=key`;
+    output.appendLine(`Fetching API key from key server: ${url}`);
+
+    // use global fetch available in Node 18+ / extension host
+    const resp = await (globalThis as any).fetch(url, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
     });
-    console.log(resp)
-    if (resp.status !== 200) {
-      throw new Error(`/key returned ${resp.status}: ${resp.data || ''}`);
+
+    if (!resp) throw new Error('No response from fetch()');
+
+    const status = resp.status ?? 0;
+    const rawText = await resp.text();
+
+    output.appendLine(`Key server status: ${status}`);
+    // log up to a reasonable size to avoid huge logs
+    output.appendLine(`Key server response (truncated): ${rawText.slice(0, 2000)}`);
+
+    if (status !== 200) {
+      let preview = rawText;
+      try { preview = JSON.stringify(JSON.parse(rawText)); } catch {}
+      throw new Error(`Key server returned status ${status}: ${preview}`);
     }
 
-    const body = resp.data;
-    if (!body || typeof body.apiKey !== 'string') {
-      throw new Error(`Invalid /key response shape: ${JSON.stringify(body)}`);
+    let body: any;
+    try { body = JSON.parse(rawText); } catch (e) { throw new Error('Failed parsing key server JSON: ' + getErrorMessage(e)); }
+
+    if (!body || typeof body.apiKey !== 'string' || body.apiKey.length === 0) {
+      throw new Error(`Invalid key server response shape (missing apiKey): ${JSON.stringify(body)}`);
     }
-    // parse expiry
+
+    // parse expiry if provided
     let expiresAtNum = Date.now() + 15 * 60 * 1000;
-    if (body.expiresAt) {
+    if (body.expiresAt && typeof body.expiresAt === 'string') {
       const parsed = Date.parse(body.expiresAt);
       if (!isNaN(parsed)) expiresAtNum = parsed;
     }
 
-    // update in-memory cache
     cachedApiKey = body.apiKey;
     cachedApiKeyExpiresAt = expiresAtNum;
+    output.appendLine(`Obtained API key from key server; expiresAt=${new Date(expiresAtNum).toISOString()}`);
 
-    // create client with new key
     const ai = new GoogleGenAI({ apiKey: cachedApiKey! });
     genaiClient = ai;
     return genaiClient;
@@ -167,13 +198,13 @@ async function initGenAI(context?: vscode.ExtensionContext) {
     let apiKey: string | undefined;
     if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) {
       apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
+      output.appendLine('Falling back to environment GOOGLE_API_KEY/GEMINI_API_KEY.');
     }
     if (!apiKey) {
       throw new Error('Failed to obtain API key from key server and no environment API key available.');
     }
     const ai = new GoogleGenAI({ apiKey });
     genaiClient = ai;
-    // do not persist env key to SecretStorage per request
     return genaiClient;
   }
 }
