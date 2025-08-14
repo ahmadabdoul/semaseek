@@ -11,6 +11,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as https from 'https';
+import axios from 'axios';
 
 // Google GenAI SDK (typed import kept loose)
 import { GoogleGenAI } from '@google/genai';
@@ -25,7 +27,7 @@ let fileUpdateStatus: vscode.StatusBarItem | null = null;
 // KEY SERVER CONFIG
 // ---------------------------
 // Replace this with your real server URL (no trailing slash recommended).
-const KEY_SERVER_URL = 'https://pottersheritage.com/semaseek/semaseek.php'; // <-- ensure no trailing slash
+const KEY_SERVER_URL = 'http://pottersheritage.com/semaseek/semaseek.php'; // <-- ensure no trailing slash
 const KEY_REFRESH_MARGIN_MS = 2 * 60 * 1000; // 2 minutes margin before expiry to refresh
 
 // in-memory cached API key (don't persist per request)
@@ -148,29 +150,22 @@ async function initGenAI(context?: vscode.ExtensionContext) {
     const url = `${base}?action=key`;
     output.appendLine(`Fetching API key from key server: ${url}`);
 
-    // use global fetch available in Node 18+ / extension host
-    const resp = await (globalThis as any).fetch(url, {
-      method: 'GET',
-      headers: { 'Accept': 'application/json' }
+    // agent to bypass SSL verification for this request
+    const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+    // use axios for robust http requests
+    const resp = await axios.get(url, {
+      headers: { 'Accept': 'application/json' },
+      httpsAgent
     });
 
-    if (!resp) throw new Error('No response from fetch()');
-
-    const status = resp.status ?? 0;
-    const rawText = await resp.text();
+    // axios throws on non-2xx, so we can assume success if we reach here
+    const status = resp.status;
+    const body = resp.data;
+    const rawText = body ? JSON.stringify(body) : ''; // for logging
 
     output.appendLine(`Key server status: ${status}`);
-    // log up to a reasonable size to avoid huge logs
     output.appendLine(`Key server response (truncated): ${rawText.slice(0, 2000)}`);
-
-    if (status !== 200) {
-      let preview = rawText;
-      try { preview = JSON.stringify(JSON.parse(rawText)); } catch {}
-      throw new Error(`Key server returned status ${status}: ${preview}`);
-    }
-
-    let body: any;
-    try { body = JSON.parse(rawText); } catch (e) { throw new Error('Failed parsing key server JSON: ' + getErrorMessage(e)); }
 
     if (!body || typeof body.apiKey !== 'string' || body.apiKey.length === 0) {
       throw new Error(`Invalid key server response shape (missing apiKey): ${JSON.stringify(body)}`);
