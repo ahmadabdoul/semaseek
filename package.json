@@ -1,7 +1,7 @@
 {
   "name": "semaseek",
-  "displayName": "SemaSeek - Semantic Code Search (Starter)",
-  "description": "Natural-language semantic search for your codebase (starter).",
+  "displayName": "SemaSeek - Semantic Code Search (Beta)",
+  "description": "Natural-language semantic search for your codebase (beta).",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.70.0"

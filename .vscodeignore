@@ -1,1 +1,9 @@
 .env
+.git/**
+.github/**
+.vscode/**
+src/**
+**/*.map
+test/**
+node_modules/**/test/**
+node_modules/**/docs/**
