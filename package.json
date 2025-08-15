@@ -6,7 +6,10 @@
   "engines": {
     "vscode": "^1.70.0"
   },
+  "icon": "icon.png",
   "main": "./out/extension.js",
+  "repository": {"url": "https://github.com/ahmadabdoul/semaseek"},
+  "publisher": "abdulkadir-ahmad",
   "activationEvents": [
     "onCommand:semanticSearch.indexWorkspace",
     "onCommand:semanticSearch.query",
@@ -68,7 +71,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.2.1",
-    "@types/vscode": "^1.102.0",
+    "@types/vscode": "^1.70.0",
     "@vscode/vsce": "^3.6.0",
     "typescript": "^5.9.2",
     "vscode-test": "^1.6.1"
