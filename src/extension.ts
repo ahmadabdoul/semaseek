@@ -22,7 +22,7 @@ let db: any = null; // sqlite3 Database instance
 let usingSqlite = false;
 let rawSqlite: any = null; // the sqlite3 module if loaded
 let fileUpdateStatus: vscode.StatusBarItem | null = null;
-
+const API_KEY = "";
 // ---------------------------
 // KEY SERVER CONFIG
 // ---------------------------
@@ -139,69 +139,68 @@ function normalizeEmbeddingResult(res: number[] | number[][]): number[] {
 
 async function initGenAI(context?: vscode.ExtensionContext) {
   // reuse existing client if key still valid
-  const now = Date.now();
-  if (genaiClient && cachedApiKey && cachedApiKeyExpiresAt && cachedApiKeyExpiresAt > now + KEY_REFRESH_MARGIN_MS) {
-    return genaiClient;
-  }
+  // const now = Date.now();
+  // if (genaiClient && cachedApiKey && cachedApiKeyExpiresAt && cachedApiKeyExpiresAt > now + KEY_REFRESH_MARGIN_MS) {
+  //   return genaiClient;
+  // }
 
-  // fetch key from key server
-  try {
-    const base = KEY_SERVER_URL.replace(/\/+$/, '');
-    const url = `${base}?action=key`;
-    output.appendLine(`Fetching API key from key server: ${url}`);
+  // // fetch key from key server
+  // try {
+  //   const base = KEY_SERVER_URL.replace(/\/+$/, '');
+  //   const url = `${base}?action=key`;
+  //   output.appendLine(`Fetching API key from key server: ${url}`);
 
-    // agent to bypass SSL verification for this request
-    const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+  //   // agent to bypass SSL verification for this request
+  //   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
-    // use axios for robust http requests
-    const resp = await axios.get(url, {
-      headers: { 'Accept': 'application/json' },
-      httpsAgent
-    });
+  //   // use axios for robust http requests
+  //   const resp = await axios.get(url, {
+  //     headers: { 'Accept': 'application/json' },
+  //     httpsAgent
+  //   });
 
-    // axios throws on non-2xx, so we can assume success if we reach here
-    const status = resp.status;
-    const body = resp.data;
-    const rawText = body ? JSON.stringify(body) : ''; // for logging
+  //   // axios throws on non-2xx, so we can assume success if we reach here
+  //   const status = resp.status;
+  //   const body = resp.data;
+  //   const rawText = body ? JSON.stringify(body) : ''; // for logging
 
-    output.appendLine(`Key server status: ${status}`);
-    output.appendLine(`Key server response (truncated): ${rawText.slice(0, 2000)}`);
+  //   output.appendLine(`Key server status: ${status}`);
+  //   output.appendLine(`Key server response (truncated): ${rawText.slice(0, 2000)}`);
 
-    if (!body || typeof body.apiKey !== 'string' || body.apiKey.length === 0) {
-      throw new Error(`Invalid key server response shape (missing apiKey): ${JSON.stringify(body)}`);
-    }
+  //   if (!body || typeof body.apiKey !== 'string' || body.apiKey.length === 0) {
+  //     throw new Error(`Invalid key server response shape (missing apiKey): ${JSON.stringify(body)}`);
+  //   }
 
-    // parse expiry if provided
-    let expiresAtNum = Date.now() + 15 * 60 * 1000;
-    if (body.expiresAt && typeof body.expiresAt === 'string') {
-      const parsed = Date.parse(body.expiresAt);
-      if (!isNaN(parsed)) expiresAtNum = parsed;
-    }
+  //   // parse expiry if provided
+  //   let expiresAtNum = Date.now() + 15 * 60 * 1000;
+  //   if (body.expiresAt && typeof body.expiresAt === 'string') {
+  //     const parsed = Date.parse(body.expiresAt);
+  //     if (!isNaN(parsed)) expiresAtNum = parsed;
+  //   }
 
-    cachedApiKey = body.apiKey;
-    cachedApiKeyExpiresAt = expiresAtNum;
-    output.appendLine(`Obtained API key from key server; expiresAt=${new Date(expiresAtNum).toISOString()}`);
+  //   cachedApiKey = body.apiKey;
+  //   cachedApiKeyExpiresAt = expiresAtNum;
+  //   output.appendLine(`Obtained API key from key server; expiresAt=${new Date(expiresAtNum).toISOString()}`);
 
-    const ai = new GoogleGenAI({ apiKey: cachedApiKey! });
+  //   const ai = new GoogleGenAI({ apiKey: cachedApiKey! });
+  //   genaiClient = ai;
+  //   return genaiClient;
+  // } catch (err) {
+  //   const msg = (err && (err as Error).message) ? (err as Error).message : String(err);
+  //   output.appendLine('Failed to fetch API key from key server: ' + msg);
+
+  //   // fallback to env var for developer use
+  //   let apiKey: string | undefined;
+  //   if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) {
+  //     apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
+  //     output.appendLine('Falling back to environment GOOGLE_API_KEY/GEMINI_API_KEY.');
+  //   }
+  //   if (!apiKey) {
+  //     throw new Error('Failed to obtain API key from key server and no environment API key available.');
+  //   }
+    const ai = new GoogleGenAI({ apiKey: API_KEY });
     genaiClient = ai;
     return genaiClient;
-  } catch (err) {
-    const msg = (err && (err as Error).message) ? (err as Error).message : String(err);
-    output.appendLine('Failed to fetch API key from key server: ' + msg);
-
-    // fallback to env var for developer use
-    let apiKey: string | undefined;
-    if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) {
-      apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
-      output.appendLine('Falling back to environment GOOGLE_API_KEY/GEMINI_API_KEY.');
-    }
-    if (!apiKey) {
-      throw new Error('Failed to obtain API key from key server and no environment API key available.');
-    }
-    const ai = new GoogleGenAI({ apiKey });
-    genaiClient = ai;
-    return genaiClient;
-  }
 }
 
 /**
